@@ -630,6 +630,10 @@
 #define DEFAULT_VIDEO_SMOOTH false
 #endif
 
+#define DEFAULT_VIDEO_KD30 false
+#define DEFAULT_VIDEO_KD30_MASK 0
+#define DEFAULT_VIDEO_KD30_INPUT 2
+
 /* Graphics context specific scaling */
 #define DEFAULT_VIDEO_CTX_SCALING false
 

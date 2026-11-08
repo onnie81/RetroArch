@@ -388,6 +388,8 @@ enum vulkan_texture_support
    VULKAN_TEXTURE_SUPPORT_SCRGB  = 2
 };
 
+struct kd30_state;
+
 typedef struct vk
 {
    retro_time_t presented_at;
@@ -859,8 +861,12 @@ typedef struct vk
       math_matrix_4x4 mvp;
       VkRect2D scissor;    /* int32_t alignment */
    } tracker;
+   struct kd30_state *kd30;
+   bool kd30_failed;
    uint32_t flags;
 } vk_t;
+
+static void kd30_free(vk_t *vk);
 
 #ifdef HAVE_VAAPI
 #include "vulkan_vaapi_backend.h"
@@ -7618,6 +7624,7 @@ static void vulkan_free(void *data)
       /* No need to init this since textures are create on-demand. */
       vulkan_deinit_menu(vk);
 
+      kd30_free(vk);
       vulkan_deinit_static_resources(vk);
 #ifdef HAVE_OVERLAY
       vulkan_overlay_free(vk);
@@ -7728,7 +7735,8 @@ static void vulkan_set_image(void *handle,
 
       for (i = 0; i < (int) vk->hw.num_semaphores; i++)
       {
-         vk->hw.wait_dst_stages[i] = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+         vk->hw.wait_dst_stages[i] = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
+            | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
          vk->hw.semaphores[i]      = semaphores[i];
       }
 
@@ -10692,6 +10700,8 @@ static void vulkan_views_draw_stock(vk_t *vk, struct vk_texture *src,
    vk->tracker.dirty   |= VULKAN_DIRTY_DYNAMIC_BIT;
 }
 
+#include "vulkan_kd30.h"
+
 static void vulkan_views_sci(const video_views_rect_t *r, VkRect2D *sci)
 {
    sci->offset.x      = VIDEO_POS_X(r->pos);
@@ -12696,6 +12706,9 @@ static bool vulkan_frame(void *data, const void *frame,
    bool windows_drawn                            = false;
 #endif
    bool movie_frame                              = vk->movie_pending;
+   bool kd30_on                                  =
+      config_get_ptr()->bools.video_kd30;
+   struct vulkan_filter_chain_texture kd30_input;
 
 #ifdef HAVE_OPENXR
    bool xr_window = (vk->flags & VK_FLAG_OPEN_XR) != 0;
@@ -12802,7 +12815,8 @@ static bool vulkan_frame(void *data, const void *frame,
     * (spirv_hdr_frag) so it renders directly to the swapchain â€” no offscreen needed.
     * Custom shader chains need offscreen unless they emit HDR natively. */
    if ((vk->context->flags & VK_CTX_FLAG_HDR_ENABLE)
-      && filter_chain != vk->filter_chain_default)
+      && filter_chain != vk->filter_chain_default
+      && !kd30_on)
    {
       if (vk->context->flags & VK_CTX_FLAG_HDR_SCRGB)
       {
@@ -13593,6 +13607,7 @@ static bool vulkan_frame(void *data, const void *frame,
       else
          vulkan_filter_chain_set_input_texture((vulkan_filter_chain_t*)
                filter_chain, &input);
+      kd30_input = input;
    }
 
    /* Views place themselves in the whole window. */
@@ -13606,7 +13621,27 @@ static bool vulkan_frame(void *data, const void *frame,
    xr_frame_dims = vk->vp.dims;
 #endif
 
-   if (!views)
+   if (kd30_on)
+   {
+      unsigned out_w = (unsigned)vk->video_vp.width;
+      unsigned out_h = (unsigned)vk->video_vp.height;
+      unsigned mode  = 0;
+      if (vk->context->flags & VK_CTX_FLAG_HDR_ENABLE)
+         mode = (vk->context->flags & VK_CTX_FLAG_HDR_SCRGB) ? 1 : 2;
+      if ((vk->rotation / 90) & 1)
+      {
+         unsigned t = out_w;
+         out_w      = out_h;
+         out_h      = t;
+      }
+      kd30_on = !views && kd30_render(vk, vk->cmd, &kd30_input,
+            frame || movie_frame, out_w, out_h, mode,
+            video_info->hdr_max_nits,
+            config_get_ptr()->uints.video_kd30_mask,
+            config_get_ptr()->uints.video_kd30_input);
+   }
+
+   if (!views && !kd30_on)
       vulkan_filter_chain_build_offscreen_passes(
             (vulkan_filter_chain_t*)filter_chain,
             vk->cmd, &vk->video_vp);
@@ -13721,6 +13756,8 @@ static bool vulkan_frame(void *data, const void *frame,
          vulkan_views_draw(vk, video_info, view_chains,
                !video_info->views_layout.offscreen,
                vk->context->swapchain_dims, views_direct_tex);
+      else if (kd30_on)
+         kd30_draw(vk);
       else
          vulkan_filter_chain_build_viewport_pass(
                (vulkan_filter_chain_t*)filter_chain, vk->cmd,

@@ -1,0 +1,239 @@
+#version 450
+
+// Pass 1: one workgroup per active scanline.
+// Console DAC -> video encoder (CVBS / Y-C / RGB) -> TV decoder -> cathode drive -> horizontal beam spot.
+// The line is simulated as a sampled analog waveform (N_ACT samples across the active line),
+// then resampled to the 2560-sample beam buffer consumed by the phosphor pass.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D uRawWindowTex;
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D uScanlineBuffer;
+
+layout(push_constant) uniform PushConstants {
+    uvec2 raw_size;
+    uvec2 scan_size;
+    uint  frame_count;
+    uint  scan_format;
+    uint  signal_standard; // 0 = NTSC, 1 = PAL
+    uint  input_mode;      // 0 = Composite, 1 = S-Video, 2 = Component/RGB
+    float vm_strength;
+    float horiz_smear;
+    float comb_strength;   // decoder chroma bandwidth scale
+    float sc_cyc_per_px;
+    float sc_line_step;
+    float sc_frame_step;
+    float sc_phase0;
+} pc;
+
+const int   N_ACT   = 1280;          // samples across the active line
+const int   MARGIN  = 128;           // blanking-side extension, phase-continuous
+const int   N_SIG   = N_ACT + 2 * MARGIN;
+const int   PER_T   = N_SIG / 256;
+const float TWO_PI  = 6.28318530718;
+const float TUBE_W_MM = 473.3;       // 4:3 active width of the 355 mm-high raster
+const float AMP_MHZ   = 6.0;         // TV video amplifier / cathode drive bandwidth (all inputs)
+
+shared float sY[N_SIG];
+shared float sU[N_SIG];
+shared float sV[N_SIG];
+shared float s_red[256];
+
+vec3 beam_sigma_mm(vec3 L) {
+    return vec3(0.28) + 0.30 * pow(clamp(L, vec3(0.0), vec3(1.5)), vec3(0.70));
+}
+
+vec3 to_linear(vec3 c) { return pow(max(c, vec3(0.0)), vec3(2.25)); }
+
+vec3 rgb_to_yuv(vec3 c) {
+    float y = dot(c, vec3(0.299, 0.587, 0.114));
+    return vec3(y, 0.492111 * (c.b - y), 0.877283 * (c.r - y));
+}
+
+vec3 yuv_to_rgb(vec3 v) {
+    return vec3(v.x + 1.139883 * v.z,
+                v.x - 0.394642 * v.y - 0.580622 * v.z,
+                v.x + 2.032062 * v.y);
+}
+
+float gauss_sigma_samples(float cutoff_mhz, float fs_mhz) {
+    // Gaussian low-pass with -3 dB at cutoff: sigma_t = sqrt(ln2)/(2*pi*fc)
+    return 0.13250 * fs_mhz / max(cutoff_mhz, 0.05);
+}
+
+// Gaussian FIR over one shared array; radius bounded so cost stays fixed.
+#define GAUSS_FILTER(ARR, center, sigma, result) {                          \
+    float _s = max(sigma, 0.35);                                            \
+    int   _r = min(int(ceil(3.0 * _s)), 40);                                \
+    float _k = -0.5 / (_s * _s);                                            \
+    float _acc = 0.0, _wsum = 0.0;                                          \
+    for (int _j = -_r; _j <= _r; _j++) {                                    \
+        int _i = clamp(center + _j, 0, N_SIG - 1);                          \
+        float _w = exp(_k * float(_j * _j));                                \
+        _acc += ARR[_i] * _w; _wsum += _w;                                  \
+    }                                                                       \
+    result = _acc / _wsum; }
+
+void main() {
+    uint tid    = gl_LocalInvocationID.x;
+    uint line_y = gl_WorkGroupID.y;
+    if (line_y >= pc.scan_size.y) return;
+
+    int src_y = clamp(int((float(line_y) + 0.5) * float(pc.raw_size.y) / float(pc.scan_size.y)),
+                      0, int(pc.raw_size.y) - 1);
+
+    float raw_w   = float(pc.raw_size.x);
+    float spp     = float(N_ACT) / raw_w;                       // signal samples per source pixel
+    float fsc_mhz = (pc.signal_standard == 1u) ? 4.43361875 : 3.579545;
+    float fs_mhz  = fsc_mhz * spp / max(pc.sc_cyc_per_px, 0.05); // sample rate of the simulated waveform
+    float pal_v   = (pc.signal_standard == 1u && ((src_y + int(pc.frame_count)) & 1) == 1) ? -1.0 : 1.0;
+    float line_ph = fract(pc.sc_phase0
+                        + pc.sc_line_step  * float(src_y)
+                        + pc.sc_frame_step * float(pc.frame_count));
+
+    // ---- 1. Console DAC: sample-and-hold R'G'B' (gamma-encoded voltages) -> Y'UV ----
+    for (int k = 0; k < PER_T; k++) {
+        int i = int(tid) + k * 256;
+        int px = clamp(int(floor((float(i - MARGIN) + 0.5) / spp)), 0, int(raw_w) - 1);
+        vec3 c = texelFetch(uRawWindowTex, ivec2(px, src_y), 0).rgb;
+        vec3 yuv = rgb_to_yuv(c);
+        sY[i] = yuv.x; sU[i] = yuv.y; sV[i] = yuv.z;
+    }
+    barrier();
+
+    // ---- 2. Encoder band-limiting: luma ~5.0 MHz amp, chroma 1.3 MHz before modulation ----
+    float sig_y_enc = gauss_sigma_samples((pc.input_mode == 2u) ? 8.0 : 5.0, fs_mhz);
+    float sig_c_enc = gauss_sigma_samples(1.3, fs_mhz);
+    float rY[PER_T], rU[PER_T], rV[PER_T];
+    for (int k = 0; k < PER_T; k++) {
+        int i = int(tid) + k * 256;
+        GAUSS_FILTER(sY, i, sig_y_enc, rY[k]);
+        if (pc.input_mode == 2u) { rU[k] = sU[i]; rV[k] = sV[i]; }
+        else { GAUSS_FILTER(sU, i, sig_c_enc, rU[k]); GAUSS_FILTER(sV, i, sig_c_enc, rV[k]); }
+    }
+    barrier();
+
+    float sig_c_dec = gauss_sigma_samples(0.7 * clamp(pc.comb_strength, 0.3, 2.0), fs_mhz);
+    float sig_trap  = gauss_sigma_samples(0.6, fs_mhz);
+    float sig_ylow  = gauss_sigma_samples(1.2, fs_mhz);
+    float h_ylow    = exp(-2.0 * 9.8696044 * sig_ylow * sig_ylow * pow(pc.sc_cyc_per_px / spp, 2.0));
+
+    if (pc.input_mode == 0u) {
+        // ---- 3a. CVBS = Y + U sin(wt) + V cos(wt) ----
+        for (int k = 0; k < PER_T; k++) {
+            int i = int(tid) + k * 256;
+            float ph = TWO_PI * (pc.sc_cyc_per_px * (float(i - MARGIN) + 0.5) / spp + line_ph);
+            sY[i] = rY[k] + rU[k] * sin(ph) + pal_v * rV[k] * cos(ph);
+        }
+        barrier();
+        // TV: demodulate the signal above the low luma band so flat luma never leaks into chroma
+        for (int k = 0; k < PER_T; k++) {
+            int i = int(tid) + k * 256;
+            float ph = TWO_PI * (pc.sc_cyc_per_px * (float(i - MARGIN) + 0.5) / spp + line_ph);
+            float ylow;
+            GAUSS_FILTER(sY, i, sig_ylow, ylow);
+            float hp = (sY[i] - ylow) / max(1.0 - h_ylow, 0.5);
+            sU[i] = 2.0 * hp * sin(ph);
+            sV[i] = 2.0 * hp * cos(ph);
+        }
+        barrier();
+        // chroma output: U/V low-pass; luma: CVBS minus narrow-band remodulated chroma (trap)
+        for (int k = 0; k < PER_T; k++) {
+            int i = int(tid) + k * 256;
+            float ph = TWO_PI * (pc.sc_cyc_per_px * (float(i - MARGIN) + 0.5) / spp + line_ph);
+            float u, v, ut, vt;
+            GAUSS_FILTER(sU, i, sig_c_dec, u);
+            GAUSS_FILTER(sV, i, sig_c_dec, v);
+            GAUSS_FILTER(sU, i, sig_trap, ut);
+            GAUSS_FILTER(sV, i, sig_trap, vt);
+            rY[k] = sY[i] - (ut * sin(ph) + vt * cos(ph));
+            rU[k] = u;
+            rV[k] = pal_v * v;
+        }
+        barrier();
+    } else if (pc.input_mode == 1u) {
+        // ---- 3b. Y/C: separate wires, chroma still passes the decoder's U/V low-pass ----
+        for (int k = 0; k < PER_T; k++) {
+            int i = int(tid) + k * 256;
+            sU[i] = rU[k]; sV[i] = rV[k];
+        }
+        barrier();
+        for (int k = 0; k < PER_T; k++) {
+            int i = int(tid) + k * 256;
+            GAUSS_FILTER(sU, i, sig_c_dec, rU[k]);
+            GAUSS_FILTER(sV, i, sig_c_dec, rV[k]);
+        }
+        barrier();
+    }
+
+    // ---- 4. TV video amplifier (common to every input) + ClearEdge VM -> cathode drive ----
+    for (int k = 0; k < PER_T; k++) {
+        int i = int(tid) + k * 256;
+        sY[i] = rY[k]; sU[i] = rU[k]; sV[i] = rV[k];
+    }
+    barrier();
+    float sig_amp = gauss_sigma_samples(AMP_MHZ, fs_mhz);
+    for (int k = 0; k < PER_T; k++) {
+        int i = int(tid) + k * 256;
+        GAUSS_FILTER(sY, i, sig_amp, rY[k]);
+        GAUSS_FILTER(sU, i, sig_amp, rU[k]);
+        GAUSS_FILTER(sV, i, sig_amp, rV[k]);
+    }
+    barrier();
+    for (int k = 0; k < PER_T; k++) {
+        int i = int(tid) + k * 256;
+        sY[i] = rY[k];
+    }
+    barrier();
+
+    float vm_mode = (pc.input_mode == 2u) ? 1.0 : ((pc.input_mode == 1u) ? 0.8 : 0.55);
+    float vm_k    = pc.vm_strength * vm_mode;
+    float sig_vm  = 0.45 * spp;
+    for (int k = 0; k < PER_T; k++) {
+        int i = int(tid) + k * 256;
+        float y_blur;
+        GAUSS_FILTER(sY, i, sig_vm, y_blur);
+        float y_sharp = rY[k] + vm_k * 0.4 * (rY[k] - y_blur);
+        vec3 rgb = yuv_to_rgb(vec3(y_sharp, rU[k], rV[k]));
+        vec3 lin = to_linear(clamp(rgb, 0.0, 1.08));
+        rY[k] = lin.r; rU[k] = lin.g; rV[k] = lin.b;
+    }
+    barrier();
+    for (int k = 0; k < PER_T; k++) {
+        int i = int(tid) + k * 256;
+        sY[i] = rY[k]; sU[i] = rU[k]; sV[i] = rV[k];
+    }
+    barrier();
+
+    // per-line beam current (alpha) for HV regulation sag in pass 2
+    float red_acc = 0.0;
+    for (int k = 0; k < PER_T; k++) {
+        int i = int(tid) + k * 256;
+        if (i < MARGIN || i >= MARGIN + N_ACT) continue;
+        red_acc += dot(vec3(sY[i], sU[i], sV[i]), vec3(0.299, 0.587, 0.114));
+    }
+    s_red[tid] = red_acc;
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) s_red[tid] += s_red[tid + stride];
+        barrier();
+    }
+    float line_current = s_red[0] / float(N_ACT);
+
+    // ---- 5. Horizontal beam spot: energy-conserving Gaussian scatter, waist grows with cathode current ----
+    for (uint x = tid; x < pc.scan_size.x; x += 256u) {
+        float pos = (float(x) + 0.5) / float(pc.scan_size.x) * float(N_ACT) - 0.5 + float(MARGIN);
+        int   c0  = int(round(pos));
+        vec3  acc = vec3(0.0);
+        float mm_to_s = spp * raw_w / TUBE_W_MM * pc.horiz_smear;
+        int   R    = min(int(ceil(3.0 * 0.70 * mm_to_s)) + 1, 40);
+        for (int j = -R; j <= R; j++) {
+            int i = clamp(c0 + j, 0, N_SIG - 1);
+            vec3 L = vec3(sY[i], sU[i], sV[i]);
+            vec3 sg = max(beam_sigma_mm(L) * mm_to_s, vec3(0.35));
+            vec3 d  = vec3(pos - float(c0 + j));
+            acc += L * exp(-0.5 * d * d / (sg * sg)) / (2.50662827 * sg);
+        }
+        imageStore(uScanlineBuffer, ivec2(int(x), int(line_y)), vec4(acc, line_current));
+    }
+}

@@ -286,6 +286,8 @@ typedef struct settings
       unsigned video_max_swapchain_images;
       unsigned video_filter_threads;
       unsigned video_swap_interval;
+      unsigned video_kd30_mask;
+      unsigned video_kd30_input;
       unsigned video_driver_pacing;
       unsigned video_temporal_upscaler;
       unsigned video_temporal_upscaler_quality;
@@ -718,6 +720,7 @@ typedef struct settings
       bool video_soft_filter;
       bool video_pal60_enable;
       bool video_smooth;
+      bool video_kd30;
       bool video_stereo_swap_eyes;
       bool video_openxr_enable;
       bool video_openxr_menu_follow;

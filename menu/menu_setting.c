@@ -14051,9 +14051,34 @@ static const setting_desc_t dingux_rs90_desc[] = {
 #endif
 #endif
 
+static size_t setting_get_string_representation_uint_video_kd30_mask(
+      rarch_setting_t *setting, char *s, size_t len)
+{
+   static const char *names[5] = {
+      "Sony SFP 0.45 mm", "WEGA 0.75 mm", "BVM 0.25 mm",
+      "Slot Mask", "Dot-Trio Shadow Mask" };
+   unsigned v;
+   if (!setting)
+      return 0;
+   v = *setting->value.target.unsigned_integer;
+   return strlcpy(s, names[v < 5 ? v : 0], len);
+}
+
+static size_t setting_get_string_representation_uint_video_kd30_input(
+      rarch_setting_t *setting, char *s, size_t len)
+{
+   static const char *names[3] = { "Composite", "S-Video", "Component / RGB" };
+   unsigned v;
+   if (!setting)
+      return 0;
+   v = *setting->value.target.unsigned_integer;
+   return strlcpy(s, names[v < 3 ? v : 2], len);
+}
+
 static const setting_desc_t smooth_desc[] = {
 /* GENERATED: rows come from settings_def_video_smooth.h in order. */
 #include "../settings/settings_def_video_smooth.h"
+#include "../settings/settings_def_video_kd30.h"
 };
 
 #ifdef HAVE_ODROIDGO2
