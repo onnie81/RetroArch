@@ -10143,6 +10143,8 @@ unsigned menu_displaylist_build_list(
                   { MENU_ENUM_LABEL_VIDEO_HDR_SETTINGS, PARSE_ACTION, false },
                   { MENU_ENUM_LABEL_VIDEO_STEREO_SETTINGS, PARSE_ACTION, false },
                   { MENU_ENUM_LABEL_VIDEO_KD30, PARSE_ONLY_BOOL, false },
+                  { MENU_ENUM_LABEL_VIDEO_KD30_BEAM, PARSE_ONLY_BOOL, false },
+                  { MENU_ENUM_LABEL_VIDEO_KD30_LUMA, PARSE_ONLY_UINT, false },
                   { MENU_ENUM_LABEL_VIDEO_KD30_MASK, PARSE_ONLY_UINT, false },
                   { MENU_ENUM_LABEL_VIDEO_KD30_INPUT, PARSE_ONLY_UINT, false },
                };

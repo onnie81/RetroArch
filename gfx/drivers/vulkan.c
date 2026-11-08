@@ -13638,7 +13638,12 @@ static bool vulkan_frame(void *data, const void *frame,
             frame || movie_frame, out_w, out_h, mode,
             video_info->hdr_max_nits,
             config_get_ptr()->uints.video_kd30_mask,
-            config_get_ptr()->uints.video_kd30_input);
+            config_get_ptr()->uints.video_kd30_input,
+            video_info->shader_subframes > 1 ? video_info->shader_subframes
+            : vk->context->swap_interval > 1
+            ? (unsigned)vk->context->swap_interval : 1,
+            config_get_ptr()->bools.video_kd30_beam,
+            (float)config_get_ptr()->uints.video_kd30_luma);
    }
 
    if (!views && !kd30_on)

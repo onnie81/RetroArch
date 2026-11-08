@@ -77,6 +77,7 @@ struct kd30_state
    struct kd30_line_push line_last;
    struct kd30_scan_push sp;
    unsigned cur;
+   unsigned sub;
    bool line_valid;
 };
 
@@ -531,7 +532,8 @@ static void kd30_write_image(VkWriteDescriptorSet *w,
 static bool kd30_render(vk_t *vk, VkCommandBuffer cmd,
       const struct vulkan_filter_chain_texture *input, bool new_field,
       unsigned out_w, unsigned out_h, unsigned output_mode,
-      float peak_nits, unsigned mask, unsigned input_mode)
+      float peak_nits, unsigned mask, unsigned input_mode,
+      unsigned refreshes, bool beam, float luma_nits)
 {
    VkWriteDescriptorSet w[7];
    VkDescriptorImageInfo info[7];
@@ -591,8 +593,11 @@ static bool kd30_render(vk_t *vk, VkCommandBuffer cmd,
    if (new_field)
    {
       k->cur       ^= 1;
+      k->sub        = 0;
       k->line_valid = false;
    }
+   else if (k->sub < 0xFFFF)
+      k->sub++;
    scan = &k->scan[k->cur];
    prev = &k->scan[k->cur ^ 1];
 
@@ -660,6 +665,20 @@ static bool kd30_render(vk_t *vk, VkCommandBuffer cmd,
    k->sp.comb_strength   = k->line.comb_strength;
    k->sp.mask_layout     = mask;
    k->sp.field_ms        = (float)(1000.0 / fps);
+   k->sp.crt_white_nits  = luma_nits;
+   /* Beam: each refresh shows the light the tube emits during it. A
+    * refresh past the field's last (pause, menu) shows the field's
+    * average instead of letting the phosphor go dark. */
+   if (beam && refreshes && k->sub < refreshes)
+   {
+      k->sp.window_ms    = k->sp.field_ms / (float)refreshes;
+      k->sp.cur_start_ms = -(float)k->sub * k->sp.window_ms;
+   }
+   else
+   {
+      k->sp.window_ms    = 0.0f;
+      k->sp.cur_start_ms = 0.0f;
+   }
    k->sp.output_mode     = (float)output_mode;
    k->sp.sdr_ref_nits    = output_mode == 1 ? 80.0f : 100.0f;
    if (peak_nits > 0.0f)

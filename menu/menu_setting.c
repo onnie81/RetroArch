@@ -14075,6 +14075,15 @@ static size_t setting_get_string_representation_uint_video_kd30_input(
    return strlcpy(s, names[v < 3 ? v : 2], len);
 }
 
+static size_t setting_get_string_representation_uint_video_kd30_luma(
+      rarch_setting_t *setting, char *s, size_t len)
+{
+   if (!setting)
+      return 0;
+   return (size_t)snprintf(s, len, "%u nits",
+         *setting->value.target.unsigned_integer);
+}
+
 static const setting_desc_t smooth_desc[] = {
 /* GENERATED: rows come from settings_def_video_smooth.h in order. */
 #include "../settings/settings_def_video_smooth.h"
