@@ -43,6 +43,7 @@ struct kd30_scan_push
    float zoom_factor, zoom_center_x, zoom_center_y;
    float field_ms, window_ms, cur_start_ms, output_mode;
    float crt_white_nits, display_peak_nits, sdr_ref_nits, panel_tau_ms;
+   float subpixel_layout, mask_strength;
 };
 
 struct kd30_image
@@ -409,6 +410,7 @@ static struct kd30_state *kd30_init(vk_t *vk)
    k->sp.crt_white_nits    = 160.0f;
    k->sp.display_peak_nits = 1000.0f;
    k->sp.sdr_ref_nits      = 100.0f;
+   k->sp.subpixel_layout   = 1.0f;
    RARCH_LOG("[KD-30] CRT output ready.\n");
    return k;
 }
@@ -681,6 +683,7 @@ static bool kd30_render(vk_t *vk, VkCommandBuffer cmd,
    }
    k->sp.output_mode     = (float)output_mode;
    k->sp.sdr_ref_nits    = output_mode == 1 ? 80.0f : 100.0f;
+   k->sp.mask_strength   = output_mode ? 1.0f : 0.75f;
    if (peak_nits > 0.0f)
       k->sp.display_peak_nits = peak_nits;
 

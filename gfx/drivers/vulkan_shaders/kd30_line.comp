@@ -7,10 +7,20 @@
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
+#ifdef KD30_WEB
+layout(set = 0, binding = 0) uniform texture2D uRawTex;
+layout(set = 0, binding = 2) uniform sampler uSamp;
+#define uRawWindowTex sampler2D(uRawTex, uSamp)
+#else
 layout(set = 0, binding = 0) uniform sampler2D uRawWindowTex;
+#endif
 layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D uScanlineBuffer;
 
+#ifdef KD30_WEB
+layout(set = 0, binding = 3, std140) uniform PushConstants {
+#else
 layout(push_constant) uniform PushConstants {
+#endif
     uvec2 raw_size;
     uvec2 scan_size;
     uint  frame_count;
@@ -77,7 +87,9 @@ float gauss_sigma_samples(float cutoff_mhz, float fs_mhz) {
 void main() {
     uint tid    = gl_LocalInvocationID.x;
     uint line_y = gl_WorkGroupID.y;
+#ifndef KD30_WEB
     if (line_y >= pc.scan_size.y) return;
+#endif
 
     int src_y = clamp(int((float(line_y) + 0.5) * float(pc.raw_size.y) / float(pc.scan_size.y)),
                       0, int(pc.raw_size.y) - 1);

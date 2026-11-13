@@ -2,14 +2,28 @@
 
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
+#ifdef KD30_WEB
+layout(set = 0, binding = 0) uniform texture2D uScanTex;
+layout(set = 0, binding = 2) uniform texture2D uRawTex;
+layout(set = 0, binding = 4) uniform texture2D uScanPrevTex;
+layout(set = 0, binding = 5) uniform sampler uSamp;
+#define uScanlineTex sampler2D(uScanTex, uSamp)
+#define uRawWindowTex sampler2D(uRawTex, uSamp)
+#define uScanlinePrevTex sampler2D(uScanPrevTex, uSamp)
+#else
 layout(set = 0, binding = 0) uniform sampler2D uScanlineTex;
-layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D uOutputFrame;
 layout(set = 0, binding = 2) uniform sampler2D uRawWindowTex;
 // Stateful P22 phosphor reservoir: .rgb = excited phosphor luminance, .a = last broadcast field tag
 layout(set = 0, binding = 3, rgba16f) uniform image2D uTemporalAccum;
 layout(set = 0, binding = 4) uniform sampler2D uScanlinePrevTex;
+#endif
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D uOutputFrame;
 
+#ifdef KD30_WEB
+layout(set = 0, binding = 6, std140) uniform ScanoutPush {
+#else
 layout(push_constant) uniform ScanoutPush {
+#endif
     uvec2 output_size;      // Exact window swapchain size OR 3840x2160 for 4K export
     uvec2 scan_size;        // x = 2560, y = active scanlines per field (e.g. 224/240 or 540)
     uvec2 raw_size;         // Source input pixel dimensions (e.g. 320x224 or 256x240)
@@ -45,6 +59,8 @@ layout(push_constant) uniform ScanoutPush {
     float display_peak_nits;
     float sdr_ref_nits;     // what 1.0 means in extended-linear output
     float panel_tau_ms;     // host panel pixel response (first-order); 0 = ideal
+    float subpixel_layout;  // host panel subpixels: 0 = treat pixels as points, 1 = RGB stripe, 2 = BGR stripe
+    float mask_strength;    // aperture grille contrast at 1x; 0 = per-layout default
 } pc;
 
 uvec2 pack8x8(uint r0, uint r1, uint r2, uint r3, uint r4, uint r5, uint r6, uint r7) {
@@ -462,12 +478,25 @@ vec2 map_window_to_crt_uv(vec2 win_uv, out bool in_bezel) {
 //   3. Horizontal lumina expansion across the aperture grille black carbon matrix:
 //      Strongly driven phosphor stripes expand their effective emission duty cycle across the
 //      black matrix guard band and radiate internal crystal halation into adjacent triad slots.
+#ifdef KD30_WEB
+#define KD_CUR  false
+#define KD_PREV true
+vec3 sample_subpixel_phosphor_line(bool prev, float u_r, float u_g, float u_b, float y_line) {
+    vec3 E_gun;
+    if (prev) E_gun = vec3(texture(uScanlinePrevTex, vec2(u_r, y_line)).r, texture(uScanlinePrevTex, vec2(u_g, y_line)).g,
+                           texture(uScanlinePrevTex, vec2(u_b, y_line)).b);
+    else E_gun = vec3(texture(uScanlineTex, vec2(u_r, y_line)).r, texture(uScanlineTex, vec2(u_g, y_line)).g,
+                      texture(uScanlineTex, vec2(u_b, y_line)).b);
+#else
+#define KD_CUR  uScanlineTex
+#define KD_PREV uScanlinePrevTex
 vec3 sample_subpixel_phosphor_line(sampler2D tex, float u_r, float u_g, float u_b, float y_line) {
     vec3 E_gun = vec3(
         texture(tex, vec2(u_r, y_line)).r,
         texture(tex, vec2(u_g, y_line)).g,
         texture(tex, vec2(u_b, y_line)).b
     );
+#endif
     // Non-linear P22 cathodoluminescence activator saturation
     const vec3 k_sat = vec3(0.06, 0.14, 0.22);
     vec3 over = max(E_gun - 1.0, vec3(0.0));
@@ -573,11 +602,11 @@ vec3 evaluate_crt_raster_at(vec2 uv_in, float effective_zoom, out vec3 out_susta
             }
         }
         float d  = (y_lines - (float(k) + 0.5)) * pitch_mm;
-        vec3  Lc = sample_subpixel_phosphor_line(uScanlineTex, u_r, u_g, u_b, v);
+        vec3  Lc = sample_subpixel_phosphor_line(KD_CUR, u_r, u_g, u_b, v);
         vec3  sc = beam_sigma_mm(Lc) * pc.beam_sigma_scale * bvm_waist_scale;
         scanline_rgb += wc * Lc * (pitch_mm / (2.5066283 * sc)) * exp(-0.5 * d * d / (sc * sc));
         if (any(greaterThan(wp, vec3(1e-4)))) {
-            vec3 Lp = sample_subpixel_phosphor_line(uScanlinePrevTex, u_r, u_g, u_b, v);
+            vec3 Lp = sample_subpixel_phosphor_line(KD_PREV, u_r, u_g, u_b, v);
             vec3 sp = beam_sigma_mm(Lp) * pc.beam_sigma_scale * bvm_waist_scale;
             scanline_rgb += wp * Lp * (pitch_mm / (2.5066283 * sp)) * exp(-0.5 * d * d / (sp * sp));
         }
@@ -594,17 +623,30 @@ vec3 evaluate_crt_raster_at(vec2 uv_in, float effective_zoom, out vec3 out_susta
         // Horizontal Lumina Expansion: strongly excited phosphor stripes expand their effective
         // crystal duty cycle across the black carbon guard band (from 0.24 at dark up to 0.38 at peak)!
         vec3 duty = clamp(vec3(0.24) + 0.14 * pow(clamp(scanline_rgb, vec3(0.0), vec3(1.4)), vec3(0.75)), vec3(0.23), vec3(0.39));
-        vec3 phases1 = 6.28318530 * (triad_phase - vec3(0.1666667, 0.5000000, 0.8333333));
+        // On a striped panel each colour is shown by its own subpixel: evaluate the stripes there,
+        // box-filtered over that subpixel, keeping each harmonic below the subpixel sampling limit.
+        bool  subpx   = pc.subpixel_layout > 0.5;
+        vec3  sub_off = pc.subpixel_layout > 1.5 ? vec3(0.3333333, 0.0, -0.3333333)
+                      : (subpx ? vec3(-0.3333333, 0.0, 0.3333333) : vec3(0.0));
+        vec3  tphase  = fract(vec3(triad_coord) + sub_off * d_triad);
+        vec3 phases1 = 6.28318530 * (tphase - vec3(0.1666667, 0.5000000, 0.8333333));
         vec3 phases2 = 2.0 * phases1;
         vec3 phases3 = 3.0 * phases1;
 
-        float p_arg1 = 3.14159265 * min(d_triad, 1.0);
-        float p_arg2 = 6.28318530 * min(d_triad, 0.5);
-        float p_arg3 = 9.42477796 * min(d_triad, 0.3333);
-
-        float px_sinc1 = (sin(p_arg1) / max(p_arg1, 1e-4)) * smoothstep(0.92, 0.18, d_triad);
-        float px_sinc2 = (sin(p_arg2) / max(p_arg2, 1e-4)) * smoothstep(0.50, 0.14, d_triad);
-        float px_sinc3 = (sin(p_arg3) / max(p_arg3, 1e-4)) * smoothstep(0.33, 0.09, d_triad);
+        float px_sinc1, px_sinc2, px_sinc3;
+        if (subpx) {
+            float w = 3.14159265 * d_triad / 3.0;
+            px_sinc1 = (sin(w) / max(w, 1e-4)) * smoothstep(0.50, 0.36, d_triad);
+            px_sinc2 = (sin(2.0 * w) / max(2.0 * w, 1e-4)) * smoothstep(0.25, 0.18, d_triad);
+            px_sinc3 = (sin(3.0 * w) / max(3.0 * w, 1e-4)) * smoothstep(0.1667, 0.12, d_triad);
+        } else {
+            float p_arg1 = 3.14159265 * min(d_triad, 1.0);
+            float p_arg2 = 6.28318530 * min(d_triad, 0.5);
+            float p_arg3 = 9.42477796 * min(d_triad, 0.3333);
+            px_sinc1 = (sin(p_arg1) / max(p_arg1, 1e-4)) * smoothstep(0.92, 0.18, d_triad);
+            px_sinc2 = (sin(p_arg2) / max(p_arg2, 1e-4)) * smoothstep(0.50, 0.14, d_triad);
+            px_sinc3 = (sin(p_arg3) / max(p_arg3, 1e-4)) * smoothstep(0.33, 0.09, d_triad);
+        }
 
         vec3 st_sinc1 = (sin(3.14159265 * duty) / (3.14159265 * duty)) * 0.9003;
         vec3 st_sinc2 = (sin(6.28318530 * duty) / (6.28318530 * duty)) * 0.6366;
@@ -621,7 +663,8 @@ vec3 evaluate_crt_raster_at(vec2 uv_in, float effective_zoom, out vec3 out_susta
         vec3 crystal_scatter = scanline_rgb * (0.16 + 0.24 * clamp(scanline_rgb + vec3(triad_luma * 0.35), vec3(0.0), vec3(1.0)));
 
         // At 1x scale, blend between gentle eye-integrated triad contrast and full macro stripes based on pixel density
-        float grille_strength_1x = (pc.mask_layout == 1u) ? 0.38 : ((pc.mask_layout == 2u) ? 0.18 : 0.28);
+        float grille_strength_1x = pc.mask_strength > 0.0 ? pc.mask_strength
+                                 : ((pc.mask_layout == 1u) ? 0.38 : ((pc.mask_layout == 2u) ? 0.18 : 0.28));
         float blend_to_full = mix(grille_strength_1x, 1.0, macro_blend);
         vec3 eff_grille = mix(vec3(1.0), grille_full, blend_to_full);
 
@@ -731,6 +774,9 @@ vec4 to_swapchain(vec3 working) {
 // First-order panel response: choose the drive so the light the panel emits over this refresh
 // equals the CRT light integrated over the same interval. Panel state lives in uTemporalAccum.
 vec3 compensate_panel(vec3 target, ivec2 px) {
+#ifdef KD30_WEB
+    return target;
+#else
     if (pc.window_ms <= 0.0 || pc.panel_tau_ms < 0.05) return target;
     vec3 y0 = imageLoad(uTemporalAccum, px).rgb;
     float e = exp(-pc.window_ms / pc.panel_tau_ms);
@@ -740,6 +786,7 @@ vec3 compensate_panel(vec3 target, ivec2 px) {
     vec3 drive = clamp(target + gain * (target - y0), vec3(0.0), vec3(peak));
     imageStore(uTemporalAccum, px, vec4(drive + (y0 - drive) * e, 0.0));
     return drive;
+#endif
 }
 
 vec3 sample_raw_nearest(vec2 uv) {
