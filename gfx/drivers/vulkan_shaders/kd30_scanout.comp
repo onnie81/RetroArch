@@ -539,8 +539,49 @@ vec3 p22_emitted(float a, float b) {
          + (1.0 - P22_FAST_FRAC) * (exp(-a3 / P22_TAU_SLOW) - exp(-b3 / P22_TAU_SLOW));
 }
 
+const float GRAPHICS_WHITE_NITS = 203.0;
+
 vec3 beam_sigma_mm(vec3 L) {
     return vec3(0.28) + 0.30 * pow(clamp(L, vec3(0.0), vec3(1.5)), vec3(0.70));
+}
+
+// Widest spot, as a fraction of the line pitch, that still leaves a dark gap between lines
+// (dark drive, full drive): tight on a BVM, softest on a dot mask.
+vec2 spot_gap_ratio(uint mask) {
+    if (mask == 1u) return vec2(0.22, 0.40);
+    if (mask == 2u) return vec2(0.17, 0.33);
+    if (mask == 3u) return vec2(0.24, 0.42);
+    if (mask == 4u) return vec2(0.25, 0.44);
+    return vec2(0.20, 0.38);
+}
+
+vec3 spot_sigma_mm(vec3 L, float pitch_mm, float waist) {
+    vec2  r   = spot_gap_ratio(pc.mask_layout);
+    vec3  cap = pitch_mm * (r.x + (r.y - r.x) * min(pow(clamp(L, vec3(0.0), vec3(1.5)), vec3(0.70)), vec3(1.0)));
+    return min(beam_sigma_mm(L) * waist, cap) * pc.beam_sigma_scale;
+}
+
+// Light of one excitation emitted from 0 to t ms after it (P22 flash plus the interlace hold share).
+vec3 emitted_by(float t, float hold, float rev) {
+    return (1.0 - hold) * p22_emitted(0.0, t) + vec3(hold * clamp(t / rev, 0.0, 1.0));
+}
+
+// Light this refresh window shows of an excitation tn ms after the window start, given the most the
+// display can show per window (cap, same units). Light that doesn't fit is carried to the following
+// windows, so a line's total light doesn't depend on where the refreshes fall.
+vec3 window_share(float tn, float g, float hold, float rev, vec3 cap) {
+    float W = pc.window_ms;
+    if (W - tn <= 0.0) return vec3(0.0);
+    float m  = max(0.0, -floor(tn / W));
+    vec3  s0 = g * emitted_by(-tn, hold, rev);
+    vec3  s1 = g * emitted_by(W - tn, hold, rev);
+    return min((m + 1.0) * cap, s1) - min(m * cap, s0);
+}
+
+// Most light one refresh can show, in drive units (1.0 = flat full-drive field).
+float display_cap() {
+    if (pc.output_mode < 0.5) return 1.0;
+    return max(pc.display_peak_nits / GRAPHICS_WHITE_NITS, 1.0) * GRAPHICS_WHITE_NITS / max(pc.crt_white_nits, 1.0);
 }
 
 vec3 evaluate_crt_raster_at(vec2 uv_in, float effective_zoom, out vec3 out_sustained_rgb) {
@@ -607,34 +648,33 @@ vec3 evaluate_crt_raster_at(vec2 uv_in, float effective_zoom, out vec3 out_susta
     bool  timed    = (pc.window_ms > 0.0 && pc.field_ms > 0.0);
     int   cur_par  = int(pc.frame_count & 1u);
     vec3  scanline_rgb = vec3(0.0);
+    float cap_drive = display_cap();
     for (int j = -2; j <= 2; j++) {
         int k = k0 + j;
         if (k < 0 || k >= int(num_lines)) continue;
         float v  = (float(k) + 0.5) / num_lines;
-        vec3  wc = vec3(1.0), wp = vec3(0.0);
-        if (timed) {
-            float t0 = pc.cur_start_ms + v * pc.field_ms * 0.92;
-            float g  = (interlaced ? 2.0 : 1.0) * pc.field_ms / pc.window_ms;
-            int   n0 = (interlaced && (k & 1) != cur_par) ? 1 : 0;
-            int   st = interlaced ? 2 : 1;
-            wc = vec3(0.0);
-            float hold = interlaced ? INTERLACE_HOLD : 0.0;
-            float rev  = float(st) * pc.field_ms;
-            for (int n = n0; n < 4; n += st) {
-                float tn = t0 - float(n) * pc.field_ms;
-                float held = max(0.0, min(pc.window_ms, tn + rev) - max(0.0, tn)) / rev;
-                vec3  w  = g * ((1.0 - hold) * p22_emitted(-tn, pc.window_ms - tn) + hold * held);
-                if (n <= 1 && (n == 0 || interlaced)) wc += w; else wp += w;
-            }
-        }
         float d  = (y_lines - (float(k) + 0.5)) * pitch_mm;
         vec3  Lc = sample_subpixel_phosphor_line(KD_CUR, u_r, u_g, u_b, v);
-        vec3  sc = beam_sigma_mm(Lc) * pc.beam_sigma_scale * bvm_waist_scale;
-        scanline_rgb += wc * Lc * (pitch_mm / (2.5066283 * sc)) * exp(-0.5 * d * d / (sc * sc));
-        if (any(greaterThan(wp, vec3(1e-4)))) {
-            vec3 Lp = sample_subpixel_phosphor_line(KD_PREV, u_r, u_g, u_b, v);
-            vec3 sp = beam_sigma_mm(Lp) * pc.beam_sigma_scale * bvm_waist_scale;
-            scanline_rgb += wp * Lp * (pitch_mm / (2.5066283 * sp)) * exp(-0.5 * d * d / (sp * sp));
+        vec3  sc = spot_sigma_mm(Lc, pitch_mm, bvm_waist_scale);
+        vec3  ac = Lc * (pitch_mm / (2.5066283 * sc)) * exp(-0.5 * d * d / (sc * sc));
+        if (!timed) { scanline_rgb += ac; continue; }
+        float t0 = pc.cur_start_ms + v * pc.field_ms * 0.92;
+        float g  = (interlaced ? 2.0 : 1.0) * pc.field_ms / pc.window_ms;
+        int   n0 = (interlaced && (k & 1) != cur_par) ? 1 : 0;
+        int   st = interlaced ? 2 : 1;
+        float hold = interlaced ? INTERLACE_HOLD : 0.0;
+        float rev  = float(st) * pc.field_ms;
+        vec3  ap = vec3(-1.0);
+        for (int n = n0; n < 4; n += st) {
+            bool cur = n <= 1 && (n == 0 || interlaced);
+            if (!cur && ap.x < 0.0) {
+                vec3 Lp = sample_subpixel_phosphor_line(KD_PREV, u_r, u_g, u_b, v);
+                vec3 sp = spot_sigma_mm(Lp, pitch_mm, bvm_waist_scale);
+                ap = Lp * (pitch_mm / (2.5066283 * sp)) * exp(-0.5 * d * d / (sp * sp));
+            }
+            vec3 a = cur ? ac : ap;
+            vec3 w = window_share(t0 - float(n) * pc.field_ms, g, hold, rev, cap_drive / max(a, vec3(1e-4)));
+            scanline_rgb += w * a;
         }
     }
     out_sustained_rgb = scanline_rgb;
@@ -772,8 +812,6 @@ vec3 encode_chromaticity_preserving_output(vec3 linear_rgb, float headroom) {
     }
     return pow(c, vec3(1.0 / 2.2));
 }
-
-const float GRAPHICS_WHITE_NITS = 203.0;
 
 // CRT light (drive units, 1.0 = flat full-drive field) -> working value (sRGB-shaped, may exceed 1 in HDR)
 vec3 encode_crt(vec3 lin) {
