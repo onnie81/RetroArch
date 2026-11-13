@@ -527,6 +527,11 @@ const vec3 P22_FAST_FRAC = vec3(0.90, 0.85, 0.90);
 const vec3 P22_TAU_FAST  = vec3(1.00, 0.06, 0.03);
 const vec3 P22_TAU_SLOW  = vec3(4.00, 3.00, 2.00);
 
+// Interlaced tracks are rescanned only every other field. Most of their light still comes in the
+// P22 flash, but this share is held evenly until the beam returns, so the other field's lines stay
+// visible on a sample-and-hold panel instead of going black between their flashes.
+const float INTERLACE_HOLD = 0.6;
+
 // Fraction of one excitation's light emitted between a and b ms after it.
 vec3 p22_emitted(float a, float b) {
     vec3 a3 = vec3(max(a, 0.0)), b3 = vec3(max(b, 0.0));
@@ -613,9 +618,12 @@ vec3 evaluate_crt_raster_at(vec2 uv_in, float effective_zoom, out vec3 out_susta
             int   n0 = (interlaced && (k & 1) != cur_par) ? 1 : 0;
             int   st = interlaced ? 2 : 1;
             wc = vec3(0.0);
+            float hold = interlaced ? INTERLACE_HOLD : 0.0;
+            float rev  = float(st) * pc.field_ms;
             for (int n = n0; n < 4; n += st) {
                 float tn = t0 - float(n) * pc.field_ms;
-                vec3  w  = g * p22_emitted(-tn, pc.window_ms - tn);
+                float held = max(0.0, min(pc.window_ms, tn + rev) - max(0.0, tn)) / rev;
+                vec3  w  = g * ((1.0 - hold) * p22_emitted(-tn, pc.window_ms - tn) + hold * held);
                 if (n <= 1 && (n == 0 || interlaced)) wc += w; else wp += w;
             }
         }
