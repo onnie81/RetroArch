@@ -65,7 +65,7 @@ struct kd30_state
 {
    VkDescriptorSetLayout line_dsl, scan_dsl;
    VkPipelineLayout line_layout, scan_layout;
-   VkPipeline line_pipe, scan_pipe;
+   VkPipeline line_pipe, scan_pipe, beam_pipe;
    VkDescriptorPool pool;
    VkDescriptorSet line_set[VULKAN_MAX_SWAPCHAIN_IMAGES];
    VkDescriptorSet scan_set[VULKAN_MAX_SWAPCHAIN_IMAGES];
@@ -199,11 +199,16 @@ static bool kd30_image_ensure(vk_t *vk, struct kd30_state *k,
    return kd30_image_create(vk, img, w, h);
 }
 
+/* beam sets specialisation constant 0: the scanout shader's beam timing,
+ * kept out of the steady pipeline. */
 static VkPipeline kd30_pipeline(vk_t *vk, VkPipelineLayout layout,
-      const uint32_t *code, size_t size)
+      const uint32_t *code, size_t size, bool beam)
 {
    VkShaderModuleCreateInfo mod;
    VkComputePipelineCreateInfo info;
+   VkSpecializationMapEntry entry;
+   VkSpecializationInfo spec;
+   VkBool32 on = VK_TRUE;
    VkPipeline pipe = VK_NULL_HANDLE;
    VkShaderModule shader;
 
@@ -223,6 +228,17 @@ static VkPipeline kd30_pipeline(vk_t *vk, VkPipelineLayout layout,
    info.stage.module = shader;
    info.stage.pName  = "main";
    info.layout       = layout;
+   if (beam)
+   {
+      entry.constantID   = 0;
+      entry.offset       = 0;
+      entry.size         = sizeof(VkBool32);
+      spec.mapEntryCount = 1;
+      spec.pMapEntries   = &entry;
+      spec.dataSize      = sizeof(VkBool32);
+      spec.pData         = &on;
+      info.stage.pSpecializationInfo = &spec;
+   }
    vkCreateComputePipelines(vk->context->device, vk->pipelines.cache,
          1, &info, NULL, &pipe);
    vkDestroyShaderModule(vk->context->device, shader, NULL);
@@ -288,6 +304,8 @@ static void kd30_free(vk_t *vk)
       vkDestroyPipeline(dev, k->line_pipe, NULL);
    if (k->scan_pipe)
       vkDestroyPipeline(dev, k->scan_pipe, NULL);
+   if (k->beam_pipe)
+      vkDestroyPipeline(dev, k->beam_pipe, NULL);
    if (k->line_layout)
       vkDestroyPipelineLayout(dev, k->line_layout, NULL);
    if (k->scan_layout)
@@ -388,10 +406,12 @@ static struct kd30_state *kd30_init(vk_t *vk)
    }
 
    k->line_pipe = kd30_pipeline(vk, k->line_layout,
-         line_comp, sizeof(line_comp));
+         line_comp, sizeof(line_comp), false);
    k->scan_pipe = kd30_pipeline(vk, k->scan_layout,
-         scan_comp, sizeof(scan_comp));
-   if (!k->line_pipe || !k->scan_pipe)
+         scan_comp, sizeof(scan_comp), false);
+   k->beam_pipe = kd30_pipeline(vk, k->scan_layout,
+         scan_comp, sizeof(scan_comp), true);
+   if (!k->line_pipe || !k->scan_pipe || !k->beam_pipe)
    {
       kd30_free(vk);
       return NULL;
@@ -687,7 +707,8 @@ static bool kd30_render(vk_t *vk, VkCommandBuffer cmd,
    if (peak_nits > 0.0f)
       k->sp.display_peak_nits = peak_nits;
 
-   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, k->scan_pipe);
+   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+         k->sp.window_ms > 0.0f ? k->beam_pipe : k->scan_pipe);
    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
          k->scan_layout, 0, 1, &k->scan_set[slot], 0, NULL);
    vkCmdPushConstants(cmd, k->scan_layout, VK_SHADER_STAGE_COMPUTE_BIT,

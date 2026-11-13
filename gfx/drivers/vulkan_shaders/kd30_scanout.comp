@@ -2,6 +2,15 @@
 
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
+// Beam timing (B) and the steady scanout are separate pipelines, so the steady one carries no beam code.
+#if defined(KD30_WEB) && defined(KD30_BEAM)
+const bool KD_BEAM = true;
+#elif defined(KD30_WEB)
+const bool KD_BEAM = false;
+#else
+layout(constant_id = 0) const bool KD_BEAM = false;
+#endif
+
 #ifdef KD30_WEB
 layout(set = 0, binding = 0) uniform texture2D uScanTex;
 layout(set = 0, binding = 2) uniform texture2D uRawTex;
@@ -527,18 +536,6 @@ const vec3 P22_FAST_FRAC = vec3(0.90, 0.85, 0.90);
 const vec3 P22_TAU_FAST  = vec3(1.00, 0.06, 0.03);
 const vec3 P22_TAU_SLOW  = vec3(4.00, 3.00, 2.00);
 
-// Interlaced tracks are rescanned only every other field. Most of their light still comes in the
-// P22 flash, but this share is held evenly until the beam returns, so the other field's lines stay
-// visible on a sample-and-hold panel instead of going black between their flashes.
-const float INTERLACE_HOLD = 0.6;
-
-// Fraction of one excitation's light emitted between a and b ms after it.
-vec3 p22_emitted(float a, float b) {
-    vec3 a3 = vec3(max(a, 0.0)), b3 = vec3(max(b, 0.0));
-    return P22_FAST_FRAC * (exp(-a3 / P22_TAU_FAST) - exp(-b3 / P22_TAU_FAST))
-         + (1.0 - P22_FAST_FRAC) * (exp(-a3 / P22_TAU_SLOW) - exp(-b3 / P22_TAU_SLOW));
-}
-
 const float GRAPHICS_WHITE_NITS = 203.0;
 
 vec3 beam_sigma_mm(vec3 L) {
@@ -557,25 +554,27 @@ vec2 spot_gap_ratio(uint mask) {
 
 vec3 spot_sigma_mm(vec3 L, float pitch_mm, float waist) {
     vec2  r   = spot_gap_ratio(pc.mask_layout);
-    vec3  cap = pitch_mm * (r.x + (r.y - r.x) * min(pow(clamp(L, vec3(0.0), vec3(1.5)), vec3(0.70)), vec3(1.0)));
-    return min(beam_sigma_mm(L) * waist, cap) * pc.beam_sigma_scale;
+    vec3  b   = pow(clamp(L, vec3(0.0), vec3(1.5)), vec3(0.70));
+    vec3  cap = pitch_mm * (r.x + (r.y - r.x) * min(b, vec3(1.0)));
+    return min((vec3(0.28) + 0.30 * b) * waist, cap) * pc.beam_sigma_scale;
 }
 
-// Light of one excitation emitted from 0 to t ms after it (P22 flash plus the interlace hold share).
-vec3 emitted_by(float t, float hold, float rev) {
-    return (1.0 - hold) * p22_emitted(0.0, t) + vec3(hold * clamp(t / rev, 0.0, 1.0));
+// Light of one excitation emitted from 0 to t ms after it; past 8 ms only the slow tails remain.
+vec3 p22_cumulative(float t) {
+    if (t >= 8.0) return vec3(1.0) - (1.0 - P22_FAST_FRAC) * exp(-vec3(t) / P22_TAU_SLOW);
+    vec3 t3 = vec3(max(t, 0.0));
+    return P22_FAST_FRAC * (1.0 - exp(-t3 / P22_TAU_FAST)) + (1.0 - P22_FAST_FRAC) * (1.0 - exp(-t3 / P22_TAU_SLOW));
 }
 
-// Light this refresh window shows of an excitation tn ms after the window start, given the most the
-// display can show per window (cap, same units). Light that doesn't fit is carried to the following
-// windows, so a line's total light doesn't depend on where the refreshes fall.
-vec3 window_share(float tn, float g, float hold, float rev, vec3 cap) {
-    float W = pc.window_ms;
-    if (W - tn <= 0.0) return vec3(0.0);
-    float m  = max(0.0, -floor(tn / W));
-    vec3  s0 = g * emitted_by(-tn, hold, rev);
-    vec3  s1 = g * emitted_by(W - tn, hold, rev);
-    return min((m + 1.0) * cap, s1) - min(m * cap, s0);
+// Light a refresh shows of a pass m refreshes back (scaled by g, the excitation's light per refresh
+// it would get if spread evenly), when the display can show at most cap per refresh: s0 and s1 are
+// what the pass has emitted by the start and end of this refresh, sf by the end of its own.
+// Light that doesn't fit is carried to the following refreshes, so a line's total light doesn't
+// depend on where the refreshes fall: by the end of a refresh no more is shown than emitted, than
+// cap per refresh since the pass, nor than its own refresh showed plus cap per refresh after it.
+vec3 carried_share(float m, vec3 s0, vec3 s1, vec3 sf, vec3 cap) {
+    if (m < 0.5) return min(cap, s1);
+    return min(min((m + 1.0) * cap, s1), sf + m * cap) - min(min(m * cap, s0), sf + (m - 1.0) * cap);
 }
 
 // Most light one refresh can show, in drive units (1.0 = flat full-drive field).
@@ -584,14 +583,170 @@ float display_cap() {
     return max(pc.display_peak_nits / GRAPHICS_WHITE_NITS, 1.0) * GRAPHICS_WHITE_NITS / max(pc.crt_white_nits, 1.0);
 }
 
-vec3 evaluate_crt_raster_at(vec2 uv_in, float effective_zoom, out vec3 out_sustained_rgb) {
-    float num_lines = float(pc.scan_size.y);
-    float line_idx_raw = clamp(floor(uv_in.y * num_lines), 0.0, num_lines - 1.0);
-    float line_curr  = texture(uScanlineTex, vec2(0.5, (line_idx_raw + 0.5) / num_lines)).a;
-    float frame_curr = texture(uScanlineTex, vec2(0.5, 0.5)).a;
-    float hv_sag     = mix(frame_curr, line_curr, 0.65) * pc.hv_breathing;
+// Aperture mask as a factor on the beam's light; stripes and dots widen with the beam level.
+vec3 mask_factor(vec3 level, float effective_zoom, float total_triads, float inst_freq_scale, float triad_coord,
+                 float triad_idx, float triad_phase, float scan_y_for_mask) {
+    // Evaluate Selected Phosphor Grille / Mask Layout (0..4) with Horizontal Lumina Expansion:
+    float effective_res_x = float(pc.output_size.x) * max(effective_zoom, 1.0);
+    float d_triad = (total_triads * inst_freq_scale) / effective_res_x;
+    float macro_blend = clamp((effective_zoom - 1.5) / 4.0, 0.0, 1.0);
 
-    vec2 uv = (uv_in - 0.5) / (1.0 + hv_sag) + 0.5;
+    if (pc.mask_layout <= 2u) {
+        // Horizontal Lumina Expansion: strongly excited phosphor stripes expand their effective
+        // crystal duty cycle across the black carbon guard band (from 0.24 at dark up to 0.38 at peak)!
+        vec3 duty = clamp(vec3(0.24) + 0.14 * pow(clamp(level, vec3(0.0), vec3(1.4)), vec3(0.75)), vec3(0.23), vec3(0.39));
+        // On a striped panel each colour is shown by its own subpixel: evaluate the stripes there,
+        // box-filtered over that subpixel, keeping each harmonic below the subpixel sampling limit.
+        bool  subpx   = pc.subpixel_layout > 0.5;
+        vec3  sub_off = pc.subpixel_layout > 1.5 ? vec3(0.3333333, 0.0, -0.3333333)
+                      : (subpx ? vec3(-0.3333333, 0.0, 0.3333333) : vec3(0.0));
+        vec3  tphase  = fract(vec3(triad_coord) + sub_off * d_triad);
+        vec3 phases1 = 6.28318530 * (tphase - vec3(0.1666667, 0.5000000, 0.8333333));
+        vec3 phases2 = 2.0 * phases1;
+        vec3 phases3 = 3.0 * phases1;
+
+        float px_sinc1, px_sinc2, px_sinc3;
+        if (subpx) {
+            float w = 3.14159265 * d_triad / 3.0;
+            px_sinc1 = (sin(w) / max(w, 1e-4)) * smoothstep(0.50, 0.36, d_triad);
+            px_sinc2 = (sin(2.0 * w) / max(2.0 * w, 1e-4)) * smoothstep(0.25, 0.18, d_triad);
+            px_sinc3 = (sin(3.0 * w) / max(3.0 * w, 1e-4)) * smoothstep(0.1667, 0.12, d_triad);
+        } else {
+            float p_arg1 = 3.14159265 * min(d_triad, 1.0);
+            float p_arg2 = 6.28318530 * min(d_triad, 0.5);
+            float p_arg3 = 9.42477796 * min(d_triad, 0.3333);
+            px_sinc1 = (sin(p_arg1) / max(p_arg1, 1e-4)) * smoothstep(0.92, 0.18, d_triad);
+            px_sinc2 = (sin(p_arg2) / max(p_arg2, 1e-4)) * smoothstep(0.50, 0.14, d_triad);
+            px_sinc3 = (sin(p_arg3) / max(p_arg3, 1e-4)) * smoothstep(0.33, 0.09, d_triad);
+        }
+
+        vec3 st_sinc1 = (sin(3.14159265 * duty) / (3.14159265 * duty)) * 0.9003;
+        vec3 st_sinc2 = (sin(6.28318530 * duty) / (6.28318530 * duty)) * 0.6366;
+        vec3 st_sinc3 = (sin(9.42477796 * duty) / (9.42477796 * duty)) * 0.3001;
+
+        // Unified analytical box-filtered Fourier series of the [R | Dag | G | Dag | B | Dag] stripes:
+        vec3 grille_full = max(vec3(0.0), vec3(1.0)
+                         + 2.0 * st_sinc1 * px_sinc1 * cos(phases1)
+                         + 2.0 * st_sinc2 * px_sinc2 * cos(phases2)
+                         + 2.0 * st_sinc3 * px_sinc3 * cos(phases3));
+
+        // Intra-triad phosphor crystal scatter (high-energy excitation in one stripe scatters light into the triad)
+        float triad_luma = dot(level, vec3(0.299, 0.587, 0.114));
+
+        // At 1x scale, blend between gentle eye-integrated triad contrast and full macro stripes based on pixel density
+        float grille_strength_1x = pc.mask_strength > 0.0 ? pc.mask_strength
+                                 : ((pc.mask_layout == 1u) ? 0.38 : ((pc.mask_layout == 2u) ? 0.18 : 0.28));
+        float blend_to_full = mix(grille_strength_1x, 1.0, macro_blend);
+        vec3 eff_grille = mix(vec3(1.0), grille_full, blend_to_full);
+
+        return eff_grille + (0.16 + 0.24 * clamp(level + vec3(triad_luma * 0.35), vec3(0.0), vec3(1.0))) * (0.25 * blend_to_full);
+    } else if (pc.mask_layout == 3u) {
+        vec3 phases1 = 6.28318530 * (triad_phase - vec3(0.1666667, 0.5000000, 0.8333333));
+        float p_arg1 = 3.14159265 * min(d_triad, 1.0);
+        float px_sinc1 = (sin(p_arg1) / max(p_arg1, 1e-4)) * smoothstep(0.90, 0.20, d_triad);
+
+        float col_parity = mod(triad_idx, 2.0);
+        float slot_v = fract(scan_y_for_mask * 0.5 + col_parity * 0.5);
+        float bridge = 1.0 - (0.32 + 0.38 * macro_blend) * exp(-pow((slot_v - 0.5) / 0.14, 4.0));
+
+        vec3 slot_rgb = vec3(0.88) + (0.30 + 0.55 * macro_blend) * px_sinc1 * cos(phases1);
+        slot_rgb = max(vec3(0.08), slot_rgb) * bridge;
+        vec3 mask_f = mix(slot_rgb, vec3(1.0), clamp(level * 0.38, 0.0, 0.55));
+        return mask_f;
+    } else {
+        float dot_rows    = scan_y_for_mask / 0.8660254;
+        float row_stagger = mod(floor(dot_rows), 2.0) * 0.5;
+        float dot_triad_x = fract(triad_coord + row_stagger);
+        float dot_y       = fract(dot_rows) - 0.5;
+
+        vec3 dx = abs(vec3(dot_triad_x) - vec3(0.1666667, 0.5000000, 0.8333333)) * 3.0;
+        vec3 r2 = dx * dx + vec3(dot_y * dot_y * 6.75);
+        vec3 dots = exp(-pow(r2 / (0.40 + 0.18 * clamp(level, vec3(0.0), vec3(1.0))), vec3(1.8)));
+
+        float dot_vis = smoothstep(0.90, 0.20, d_triad) * (0.35 + 0.58 * macro_blend);
+        vec3 dot_mask = mix(vec3(1.0), dots * 1.65, dot_vis);
+        return dot_mask;
+    }
+}
+
+// Beam timing of scan line k for this refresh: whether it still shows the previous picture, the
+// refreshes since its latest pass (m), and that pass's light by the end of this refresh (s1). For a
+// line passed during this refresh, sa and sb are the pass before's light by the start and end of it;
+// otherwise the latest pass's by the start of this refresh and by the end of its own.
+struct LineTiming { float m; bool prev; vec3 s1; vec3 sa; vec3 sb; };
+
+LineTiming line_timing(int k) {
+    bool  interlaced = pc.scan_format != 0u;
+    float W      = pc.window_ms;
+    float period = (interlaced ? 2.0 : 1.0) * pc.field_ms;
+    float g      = period / W;
+    float v      = (float(k) + 0.5) / float(pc.scan_size.y);
+    LineTiming t;
+    t.prev   = interlaced && (k & 1) != int(pc.frame_count & 1u);
+    float te = pc.cur_start_ms + v * pc.field_ms * 0.92 - (t.prev ? pc.field_ms : 0.0);
+    if (te >= W) { te -= period; t.prev = true; }
+    t.m  = max(0.0, -floor(te / W));
+    t.s1 = g * p22_cumulative(W - te);
+    if (t.m < 0.5) {
+        t.sa = g * p22_cumulative(period - te);
+        t.sb = g * p22_cumulative(period + W - te);
+    } else {
+        t.sa = g * p22_cumulative(-te);
+        t.sb = t.m < 1.5 ? t.sa : g * p22_cumulative(W - (te + t.m * W));
+    }
+    return t;
+}
+
+// The tube's position after the high-voltage breathing, as evaluate_crt_raster_at places it.
+vec2 breathing_uv(vec2 uv_in) {
+    float num_lines    = float(pc.scan_size.y);
+    float line_idx_raw = clamp(floor(uv_in.y * num_lines), 0.0, num_lines - 1.0);
+    float line_curr    = texture(uScanlineTex, vec2(0.5, (line_idx_raw + 0.5) / num_lines)).a;
+    float frame_curr   = texture(uScanlineTex, vec2(0.5, 0.5)).a;
+    float hv_sag       = mix(frame_curr, line_curr, 0.65) * pc.hv_breathing;
+    return (uv_in - 0.5) / (1.0 + hv_sag) + 0.5;
+}
+
+// Line timing depends only on the line, so each workgroup works it out once for the lines its rows
+// cover (rows map to lines independently of x).
+const int KD_TABLE = 48;
+shared int   tl_rowk[16];
+shared float tl_m[KD_TABLE];
+shared float tl_prev[KD_TABLE];
+shared vec3  tl_s1[KD_TABLE];
+shared vec3  tl_sa[KD_TABLE];
+shared vec3  tl_sb[KD_TABLE];
+int tl_base  = 0;
+int tl_count = 0;
+
+void fill_line_table(vec2 tube_uv) {
+    if (gl_LocalInvocationID.x == 0u) {
+        float y = breathing_uv(tube_uv).y;
+        tl_rowk[gl_LocalInvocationID.y] = (y < 0.0 || y > 1.0) ? -1 : int(floor(y * float(pc.scan_size.y)));
+    }
+    barrier();
+    int kmin = 0x7fffffff, kmax = -1;
+    for (int r = 0; r < 16; r++) {
+        int k = tl_rowk[r];
+        if (k >= 0) { kmin = min(kmin, k); kmax = max(kmax, k); }
+    }
+    tl_base  = kmin - 2;
+    tl_count = kmax >= kmin ? min(kmax - kmin + 5, KD_TABLE) : 0;
+    int i = int(gl_LocalInvocationIndex);
+    if (i < tl_count) {
+        LineTiming t = line_timing(tl_base + i);
+        tl_m[i]    = t.m;
+        tl_prev[i] = t.prev ? 1.0 : 0.0;
+        tl_s1[i]   = t.s1;
+        tl_sa[i]   = t.sa;
+        tl_sb[i]   = t.sb;
+    }
+    barrier();
+}
+
+vec3 evaluate_crt_raster_at(vec2 uv_in, float effective_zoom, bool use_table, out vec3 out_sustained_rgb) {
+    float num_lines = float(pc.scan_size.y);
+    vec2 uv = breathing_uv(uv_in);
     if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) {
         out_sustained_rgb = vec3(0.0);
         return vec3(0.0);
@@ -645,126 +800,70 @@ vec3 evaluate_crt_raster_at(vec2 uv_in, float effective_zoom, out vec3 out_susta
     float y_lines  = uv.y * num_lines;
     int   k0       = int(floor(y_lines));
     bool  interlaced = (pc.scan_format != 0u);
-    bool  timed    = (pc.window_ms > 0.0 && pc.field_ms > 0.0);
-    int   cur_par  = int(pc.frame_count & 1u);
+    // Beam: a line lights as the beam passes it and then decays, so each refresh shows the lines
+    // scanned during it bright and the others fading. The beam passes a line every field, or every
+    // other field when interlaced: there the other field's lines are the previous field decaying.
+    // The magnifier shows the time-averaged picture.
+    bool  timed = KD_BEAM && use_table && pc.window_ms > 0.0 && pc.field_ms > 0.0;
     vec3  scanline_rgb = vec3(0.0);
-    float cap_drive = display_cap();
-    for (int j = -2; j <= 2; j++) {
-        int k = k0 + j;
-        if (k < 0 || k >= int(num_lines)) continue;
-        float v  = (float(k) + 0.5) / num_lines;
-        float d  = (y_lines - (float(k) + 0.5)) * pitch_mm;
-        vec3  Lc = sample_subpixel_phosphor_line(KD_CUR, u_r, u_g, u_b, v);
-        vec3  sc = spot_sigma_mm(Lc, pitch_mm, bvm_waist_scale);
-        vec3  ac = Lc * (pitch_mm / (2.5066283 * sc)) * exp(-0.5 * d * d / (sc * sc));
-        if (!timed) { scanline_rgb += ac; continue; }
-        float t0 = pc.cur_start_ms + v * pc.field_ms * 0.92;
-        float g  = (interlaced ? 2.0 : 1.0) * pc.field_ms / pc.window_ms;
-        int   n0 = (interlaced && (k & 1) != cur_par) ? 1 : 0;
-        int   st = interlaced ? 2 : 1;
-        float hold = interlaced ? INTERLACE_HOLD : 0.0;
-        float rev  = float(st) * pc.field_ms;
-        vec3  ap = vec3(-1.0);
-        for (int n = n0; n < 4; n += st) {
-            bool cur = n <= 1 && (n == 0 || interlaced);
-            if (!cur && ap.x < 0.0) {
-                vec3 Lp = sample_subpixel_phosphor_line(KD_PREV, u_r, u_g, u_b, v);
-                vec3 sp = spot_sigma_mm(Lp, pitch_mm, bvm_waist_scale);
-                ap = Lp * (pitch_mm / (2.5066283 * sp)) * exp(-0.5 * d * d / (sp * sp));
-            }
-            vec3 a = cur ? ac : ap;
-            vec3 w = window_share(t0 - float(n) * pc.field_ms, g, hold, rev, cap_drive / max(a, vec3(1e-4)));
-            scanline_rgb += w * a;
+    vec3  M;
+    if (!timed) {
+        for (int j = -2; j <= 2; j++) {
+            int k = k0 + j;
+            if (k < 0 || k >= int(num_lines)) continue;
+            float v  = (float(k) + 0.5) / num_lines;
+            float d  = (y_lines - (float(k) + 0.5)) * pitch_mm;
+            vec3  L  = sample_subpixel_phosphor_line(KD_CUR, u_r, u_g, u_b, v);
+            vec3  sg = spot_sigma_mm(L, pitch_mm, bvm_waist_scale);
+            scanline_rgb += L * (pitch_mm / (2.5066283 * sg)) * exp(-0.5 * d * d / (sg * sg));
+        }
+        M = mask_factor(scanline_rgb, effective_zoom, total_triads, inst_freq_scale, triad_coord, triad_idx, triad_phase,
+                        scan_y_for_mask);
+    } else {
+        // Each line as its latest pass left it: lines the beam hasn't reached yet, and when
+        // interlaced the other field's, still show the previous picture.
+        vec3 lit[5];
+        for (int j = 0; j < 5; j++) {
+            lit[j] = vec3(0.0);
+            int k = k0 + j - 2;
+            if (k < 0 || k >= int(num_lines)) continue;
+            int   i    = k - tl_base;
+            bool  prev = i >= 0 && i < tl_count && tl_prev[i] > 0.5;
+            float v    = (float(k) + 0.5) / num_lines;
+            float d    = (y_lines - (float(k) + 0.5)) * pitch_mm;
+            vec3  L;
+            if (prev) L = sample_subpixel_phosphor_line(KD_PREV, u_r, u_g, u_b, v);
+            else      L = sample_subpixel_phosphor_line(KD_CUR, u_r, u_g, u_b, v);
+            vec3  sg = spot_sigma_mm(L, pitch_mm, bvm_waist_scale);
+            lit[j] = L * (pitch_mm / (2.5066283 * sg)) * exp(-0.5 * d * d / (sg * sg));
+            scanline_rgb += lit[j];
+        }
+        M = mask_factor(scanline_rgb, effective_zoom, total_triads, inst_freq_scale, triad_coord, triad_idx, triad_phase,
+                        scan_y_for_mask);
+        // Most a refresh can show here before the mask: the output's knee over the colour matrix
+        // and the mask's gain.
+        vec3  cap = 0.76 * display_cap() / max(M, vec3(0.05));
+        float mp  = (interlaced ? 2.0 : 1.0) * pc.field_ms / pc.window_ms;
+        scanline_rgb = vec3(0.0);
+        for (int j = 0; j < 5; j++) {
+            vec3 a = lit[j];
+            if (max(a.r, max(a.g, a.b)) <= 0.0) continue;
+            int i = k0 + j - 2 - tl_base;
+            // Lines the table doesn't cover (a tiny output) show their steady light.
+            if (i < 0 || i >= tl_count) { scanline_rgb += a; continue; }
+            vec3  c  = cap / max(a, vec3(1e-4));
+            float m  = tl_m[i];
+            vec3  s1 = tl_s1[i], sa = tl_sa[i], sb = tl_sb[i];
+            // A line passed during this refresh also shows what is left of the pass before, which
+            // fell at the same point of its own refresh.
+            vec3  w  = m < 0.5 ? min(c, s1) + carried_share(mp, sa, sb, s1, c) : carried_share(m, sa, s1, sb, c);
+            scanline_rgb += min(w * a, cap);
         }
     }
     out_sustained_rgb = scanline_rgb;
 
-    // Evaluate Selected Phosphor Grille / Mask Layout (0..4) with Horizontal Lumina Expansion:
-    float effective_res_x = float(pc.output_size.x) * max(effective_zoom, 1.0);
-    float d_triad = (total_triads * inst_freq_scale) / effective_res_x;
-    float macro_blend = clamp((effective_zoom - 1.5) / 4.0, 0.0, 1.0);
-    vec3  beam = scanline_rgb;
-
-    if (pc.mask_layout <= 2u) {
-        // Horizontal Lumina Expansion: strongly excited phosphor stripes expand their effective
-        // crystal duty cycle across the black carbon guard band (from 0.24 at dark up to 0.38 at peak)!
-        vec3 duty = clamp(vec3(0.24) + 0.14 * pow(clamp(scanline_rgb, vec3(0.0), vec3(1.4)), vec3(0.75)), vec3(0.23), vec3(0.39));
-        // On a striped panel each colour is shown by its own subpixel: evaluate the stripes there,
-        // box-filtered over that subpixel, keeping each harmonic below the subpixel sampling limit.
-        bool  subpx   = pc.subpixel_layout > 0.5;
-        vec3  sub_off = pc.subpixel_layout > 1.5 ? vec3(0.3333333, 0.0, -0.3333333)
-                      : (subpx ? vec3(-0.3333333, 0.0, 0.3333333) : vec3(0.0));
-        vec3  tphase  = fract(vec3(triad_coord) + sub_off * d_triad);
-        vec3 phases1 = 6.28318530 * (tphase - vec3(0.1666667, 0.5000000, 0.8333333));
-        vec3 phases2 = 2.0 * phases1;
-        vec3 phases3 = 3.0 * phases1;
-
-        float px_sinc1, px_sinc2, px_sinc3;
-        if (subpx) {
-            float w = 3.14159265 * d_triad / 3.0;
-            px_sinc1 = (sin(w) / max(w, 1e-4)) * smoothstep(0.50, 0.36, d_triad);
-            px_sinc2 = (sin(2.0 * w) / max(2.0 * w, 1e-4)) * smoothstep(0.25, 0.18, d_triad);
-            px_sinc3 = (sin(3.0 * w) / max(3.0 * w, 1e-4)) * smoothstep(0.1667, 0.12, d_triad);
-        } else {
-            float p_arg1 = 3.14159265 * min(d_triad, 1.0);
-            float p_arg2 = 6.28318530 * min(d_triad, 0.5);
-            float p_arg3 = 9.42477796 * min(d_triad, 0.3333);
-            px_sinc1 = (sin(p_arg1) / max(p_arg1, 1e-4)) * smoothstep(0.92, 0.18, d_triad);
-            px_sinc2 = (sin(p_arg2) / max(p_arg2, 1e-4)) * smoothstep(0.50, 0.14, d_triad);
-            px_sinc3 = (sin(p_arg3) / max(p_arg3, 1e-4)) * smoothstep(0.33, 0.09, d_triad);
-        }
-
-        vec3 st_sinc1 = (sin(3.14159265 * duty) / (3.14159265 * duty)) * 0.9003;
-        vec3 st_sinc2 = (sin(6.28318530 * duty) / (6.28318530 * duty)) * 0.6366;
-        vec3 st_sinc3 = (sin(9.42477796 * duty) / (9.42477796 * duty)) * 0.3001;
-
-        // Unified analytical box-filtered Fourier series of the [R | Dag | G | Dag | B | Dag] stripes:
-        vec3 grille_full = max(vec3(0.0), vec3(1.0)
-                         + 2.0 * st_sinc1 * px_sinc1 * cos(phases1)
-                         + 2.0 * st_sinc2 * px_sinc2 * cos(phases2)
-                         + 2.0 * st_sinc3 * px_sinc3 * cos(phases3));
-
-        // Intra-triad phosphor crystal scatter (high-energy excitation in one stripe scatters light into the triad)
-        float triad_luma = dot(scanline_rgb, vec3(0.299, 0.587, 0.114));
-        vec3 crystal_scatter = scanline_rgb * (0.16 + 0.24 * clamp(scanline_rgb + vec3(triad_luma * 0.35), vec3(0.0), vec3(1.0)));
-
-        // At 1x scale, blend between gentle eye-integrated triad contrast and full macro stripes based on pixel density
-        float grille_strength_1x = pc.mask_strength > 0.0 ? pc.mask_strength
-                                 : ((pc.mask_layout == 1u) ? 0.38 : ((pc.mask_layout == 2u) ? 0.18 : 0.28));
-        float blend_to_full = mix(grille_strength_1x, 1.0, macro_blend);
-        vec3 eff_grille = mix(vec3(1.0), grille_full, blend_to_full);
-
-        beam              = scanline_rgb * eff_grille + crystal_scatter * (0.25 * blend_to_full);
-        out_sustained_rgb = out_sustained_rgb * eff_grille + crystal_scatter * (0.25 * blend_to_full);
-    } else if (pc.mask_layout == 3u) {
-        vec3 phases1 = 6.28318530 * (triad_phase - vec3(0.1666667, 0.5000000, 0.8333333));
-        float p_arg1 = 3.14159265 * min(d_triad, 1.0);
-        float px_sinc1 = (sin(p_arg1) / max(p_arg1, 1e-4)) * smoothstep(0.90, 0.20, d_triad);
-
-        float col_parity = mod(triad_idx, 2.0);
-        float slot_v = fract(scan_y_for_mask * 0.5 + col_parity * 0.5);
-        float bridge = 1.0 - (0.32 + 0.38 * macro_blend) * exp(-pow((slot_v - 0.5) / 0.14, 4.0));
-
-        vec3 slot_rgb = vec3(0.88) + (0.30 + 0.55 * macro_blend) * px_sinc1 * cos(phases1);
-        slot_rgb = max(vec3(0.08), slot_rgb) * bridge;
-        vec3 mask_f = mix(slot_rgb, vec3(1.0), clamp(scanline_rgb * 0.38, 0.0, 0.55));
-        beam              = scanline_rgb * mask_f;
-        out_sustained_rgb = out_sustained_rgb * mask_f;
-    } else {
-        float dot_rows    = scan_y_for_mask / 0.8660254;
-        float row_stagger = mod(floor(dot_rows), 2.0) * 0.5;
-        float dot_triad_x = fract(triad_coord + row_stagger);
-        float dot_y       = fract(dot_rows) - 0.5;
-
-        vec3 dx = abs(vec3(dot_triad_x) - vec3(0.1666667, 0.5000000, 0.8333333)) * 3.0;
-        vec3 r2 = dx * dx + vec3(dot_y * dot_y * 6.75);
-        vec3 dots = exp(-pow(r2 / (0.40 + 0.18 * clamp(scanline_rgb, vec3(0.0), vec3(1.0))), vec3(1.8)));
-
-        float dot_vis = smoothstep(0.90, 0.20, d_triad) * (0.35 + 0.58 * macro_blend);
-        vec3 dot_mask = mix(vec3(1.0), dots * 1.65, dot_vis);
-        beam              = scanline_rgb * dot_mask;
-        out_sustained_rgb = out_sustained_rgb * dot_mask;
-    }
+    vec3 beam = scanline_rgb * M;
+    out_sustained_rgb = out_sustained_rgb * M;
 
     if (has_damper_wires) {
         float w_top = exp(-pow((uv.y - 0.315) * float(pc.output_size.y) / 1.10, 2.0));
@@ -798,9 +897,8 @@ vec3 evaluate_crt_raster_at(vec2 uv_in, float effective_zoom, out vec3 out_susta
 // ============================================================================
 // Continuous-Time Compound-Specific P22 Phosphor Persistence Reservoir
 // ============================================================================
-// P22 decays to well under 1% within one 16.7 ms field, so nothing is carried across fields
-// except the interlace weave: a track keeps the light it was last scanned with until the
-// beam returns to it on the next field of its parity.
+// P22 decays to well under 1% within one 16.7 ms field; with B the other field's lines of an
+// interlaced scan are that decay, so they go dark until the beam returns.
 vec3 encode_chromaticity_preserving_output(vec3 linear_rgb, float headroom) {
     vec3 c = max(linear_rgb, vec3(0.0));
     float h = max(headroom, 1.0);
@@ -861,18 +959,18 @@ vec3 sample_raw_nearest(vec2 uv) {
 
 void main() {
     ivec2 px = ivec2(gl_GlobalInvocationID.xy);
-    if (px.x >= int(pc.output_size.x) || px.y >= int(pc.output_size.y)) return;
-
     vec2 win_uv = (vec2(px) + 0.5) / vec2(pc.output_size);
     bool in_bezel = false;
     vec2 tube_uv = map_window_to_crt_uv(win_uv, in_bezel);
+    if (KD_BEAM && pc.window_ms > 0.0 && pc.field_ms > 0.0) fill_line_table(tube_uv);
+    if (px.x >= int(pc.output_size.x) || px.y >= int(pc.output_size.y)) return;
 
     vec3 final_srgb = vec3(0.0);
     float field_tag = float(pc.frame_count & 255u);
 
     if (!in_bezel) {
         vec3 sustained_rgb = vec3(0.0);
-        vec3 crt_linear = evaluate_crt_raster_at(tube_uv, 1.0, sustained_rgb);
+        vec3 crt_linear = evaluate_crt_raster_at(tube_uv, 1.0, true, sustained_rgb);
         final_srgb = encode_crt(compensate_panel(crt_linear, px));
 
         if (abs(pc.split_wipe) > 0.001) {
@@ -911,7 +1009,7 @@ void main() {
 
             if (!zoom_bezel) {
                 vec3 loupe_sustained = vec3(0.0);
-                vec3 loupe_crt_lin = evaluate_crt_raster_at(zoomed_tube_uv, pc.zoom_factor, loupe_sustained);
+                vec3 loupe_crt_lin = evaluate_crt_raster_at(zoomed_tube_uv, pc.zoom_factor, false, loupe_sustained);
                 loupe_srgb = encode_crt(loupe_crt_lin);
 
                 if (abs(pc.split_wipe) > 0.001) {
