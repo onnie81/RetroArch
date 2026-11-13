@@ -335,6 +335,23 @@ int perf_char_at(int row, int col) {
         if (col >= 13 && col <= 16) return format_uint4_char(pc.raw_size.x, col - 13);
         if (col == 17) return 88;
         if (col >= 18 && col <= 21) return format_uint4_char(pc.raw_size.y, col - 18);
+    } else if (row == 2) {
+        uint w = pc.perf_overlay_on;
+        const int b0[5] = {66, 69, 65, 77, 58}; // "BEAM:"
+        if (col >= 0 && col < 5) return b0[col];
+        const int st[16] = {79,70,70,32, 79,78,32,32, 72,69,76,68, 78,47,65,32}; // OFF ON HELD N/A
+        if (col >= 5 && col < 9) return st[int((w >> 2u) & 3u) * 4 + col - 5];
+        int hz = int((w >> 4u) & 255u);
+        if (col == 10) return hz >= 100 ? 48 + hz / 100 : 32;
+        if (col == 11) return hz >= 10 ? 48 + (hz / 10) % 10 : 32;
+        if (col == 12) return 48 + hz % 10;
+        if (col == 13) return 72;
+        if (col == 14) return 90;
+        const int d0[4] = {68, 82, 80, 58}; // "DRP:"
+        if (col >= 16 && col < 20) return d0[col - 16];
+        int d = int(min(w >> 12u, 99u));
+        if (col == 20) return d >= 10 ? 48 + d / 10 : 32;
+        if (col == 21) return 48 + d % 10;
     }
     return 32;
 }
@@ -360,17 +377,18 @@ void evaluate_split_labels(vec2 uv, float split_x, bool raw_on_left, inout vec3 
 
 void evaluate_sony_wega_osd(vec2 uv, inout vec3 out_rgb) {
     if (pc.perf_overlay_on != 0u) {
-        vec2 p_min = vec2(0.74, 0.915);
+        float rows = (pc.perf_overlay_on & 2u) != 0u ? 3.0 : 2.0;
+        vec2 p_min = vec2(0.74, 0.985 - 0.035 * rows);
         vec2 p_max = vec2(0.985, 0.985);
         if (uv.x >= p_min.x && uv.x < p_max.x && uv.y >= p_min.y && uv.y < p_max.y) {
             vec2 rel = (uv - p_min) / (p_max - p_min);
             int col = int(rel.x * 22.0);
-            int row = int(rel.y * 2.0);
-            vec2 cell = fract(rel * vec2(22.0, 2.0));
+            int row = int(rel.y * rows);
+            vec2 cell = fract(rel * vec2(22.0, rows));
             int gx = int(cell.x * 10.5) - 1;
-            int gy = int(cell.y * 11.0) - 1;
+            int gy = int(cell.y * 11.0) - 2;
 
-            out_rgb = mix(out_rgb, vec3(0.01, 0.03, 0.04), 0.88);
+            out_rgb = vec3(0.01, 0.03, 0.04);
             int ch = perf_char_at(row, col);
             int hit = sample_outlined_glyph(ch, gx, gy);
             if (hit == 2) {
