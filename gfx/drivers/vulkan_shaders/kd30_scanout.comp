@@ -744,6 +744,37 @@ void fill_line_table(vec2 tube_uv) {
     barrier();
 }
 
+// One scan line's light at a point, from the picture its latest pass showed.
+vec3 line_light(int k, bool prev, float y_lines, float pitch_mm, float waist, float u_r, float u_g, float u_b) {
+    if (k < 0 || k >= int(pc.scan_size.y)) return vec3(0.0);
+    float v = (float(k) + 0.5) / float(pc.scan_size.y);
+    float d = (y_lines - (float(k) + 0.5)) * pitch_mm;
+    vec3  L;
+    if (prev) L = sample_subpixel_phosphor_line(KD_PREV, u_r, u_g, u_b, v);
+    else      L = sample_subpixel_phosphor_line(KD_CUR, u_r, u_g, u_b, v);
+    vec3 sg = spot_sigma_mm(L, pitch_mm, waist);
+    return L * (pitch_mm / (2.5066283 * sg)) * exp(-0.5 * d * d / (sg * sg));
+}
+
+bool line_prev(int k) {
+    int i = k - tl_base;
+    return i >= 0 && i < tl_count && tl_prev[i] > 0.5;
+}
+
+// What scan line k shows of its light a during this refresh, at most cap. A line passed during this
+// refresh also shows what is left of the pass before, which fell at the same point of its own refresh;
+// lines the table doesn't cover (a tiny output) show their steady light.
+vec3 line_share(int k, vec3 a, vec3 cap, float mp) {
+    if (max(a.r, max(a.g, a.b)) <= 0.0) return vec3(0.0);
+    int i = k - tl_base;
+    if (i < 0 || i >= tl_count) return a;
+    vec3  c  = cap / max(a, vec3(1e-4));
+    float m  = tl_m[i];
+    vec3  s1 = tl_s1[i], sa = tl_sa[i], sb = tl_sb[i];
+    vec3  w  = m < 0.5 ? min(c, s1) + carried_share(mp, sa, sb, s1, c) : carried_share(m, sa, s1, sb, c);
+    return min(w * a, cap);
+}
+
 vec3 evaluate_crt_raster_at(vec2 uv_in, float effective_zoom, bool use_table, out vec3 out_sustained_rgb) {
     float num_lines = float(pc.scan_size.y);
     vec2 uv = breathing_uv(uv_in);
@@ -803,62 +834,38 @@ vec3 evaluate_crt_raster_at(vec2 uv_in, float effective_zoom, bool use_table, ou
     // Beam: a line lights as the beam passes it and then decays, so each refresh shows the lines
     // scanned during it bright and the others fading. The beam passes a line every field, or every
     // other field when interlaced: there the other field's lines are the previous field decaying.
-    // The magnifier shows the time-averaged picture.
+    // The magnifier shows the time-averaged picture. A spot is at most 0.44 of the line pitch wide
+    // unless its size is raised, so lines 1.5 pitches away add under 0.3%: three lines reach a point.
     bool  timed = KD_BEAM && use_table && pc.window_ms > 0.0 && pc.field_ms > 0.0;
+    bool  wide  = pc.beam_sigma_scale > 1.15;
+    float waist = bvm_waist_scale;
     vec3  scanline_rgb = vec3(0.0);
     vec3  M;
     if (!timed) {
-        for (int j = -2; j <= 2; j++) {
-            int k = k0 + j;
-            if (k < 0 || k >= int(num_lines)) continue;
-            float v  = (float(k) + 0.5) / num_lines;
-            float d  = (y_lines - (float(k) + 0.5)) * pitch_mm;
-            vec3  L  = sample_subpixel_phosphor_line(KD_CUR, u_r, u_g, u_b, v);
-            vec3  sg = spot_sigma_mm(L, pitch_mm, bvm_waist_scale);
-            scanline_rgb += L * (pitch_mm / (2.5066283 * sg)) * exp(-0.5 * d * d / (sg * sg));
-        }
+        int reach = wide ? 2 : 1;
+        for (int j = -reach; j <= reach; j++)
+            scanline_rgb += line_light(k0 + j, false, y_lines, pitch_mm, waist, u_r, u_g, u_b);
         M = mask_factor(scanline_rgb, effective_zoom, total_triads, inst_freq_scale, triad_coord, triad_idx, triad_phase,
                         scan_y_for_mask);
     } else {
         // Each line as its latest pass left it: lines the beam hasn't reached yet, and when
         // interlaced the other field's, still show the previous picture.
-        vec3 lit[5];
-        for (int j = 0; j < 5; j++) {
-            lit[j] = vec3(0.0);
-            int k = k0 + j - 2;
-            if (k < 0 || k >= int(num_lines)) continue;
-            int   i    = k - tl_base;
-            bool  prev = i >= 0 && i < tl_count && tl_prev[i] > 0.5;
-            float v    = (float(k) + 0.5) / num_lines;
-            float d    = (y_lines - (float(k) + 0.5)) * pitch_mm;
-            vec3  L;
-            if (prev) L = sample_subpixel_phosphor_line(KD_PREV, u_r, u_g, u_b, v);
-            else      L = sample_subpixel_phosphor_line(KD_CUR, u_r, u_g, u_b, v);
-            vec3  sg = spot_sigma_mm(L, pitch_mm, bvm_waist_scale);
-            lit[j] = L * (pitch_mm / (2.5066283 * sg)) * exp(-0.5 * d * d / (sg * sg));
-            scanline_rgb += lit[j];
+        vec3 a0 = line_light(k0 - 1, line_prev(k0 - 1), y_lines, pitch_mm, waist, u_r, u_g, u_b);
+        vec3 a1 = line_light(k0,     line_prev(k0),     y_lines, pitch_mm, waist, u_r, u_g, u_b);
+        vec3 a2 = line_light(k0 + 1, line_prev(k0 + 1), y_lines, pitch_mm, waist, u_r, u_g, u_b);
+        vec3 b0 = vec3(0.0), b1 = vec3(0.0);
+        if (wide) {
+            b0 = line_light(k0 - 2, line_prev(k0 - 2), y_lines, pitch_mm, waist, u_r, u_g, u_b);
+            b1 = line_light(k0 + 2, line_prev(k0 + 2), y_lines, pitch_mm, waist, u_r, u_g, u_b);
         }
-        M = mask_factor(scanline_rgb, effective_zoom, total_triads, inst_freq_scale, triad_coord, triad_idx, triad_phase,
+        M = mask_factor(a0 + a1 + a2 + b0 + b1, effective_zoom, total_triads, inst_freq_scale, triad_coord, triad_idx, triad_phase,
                         scan_y_for_mask);
         // Most a refresh can show here before the mask: the output's knee over the colour matrix
         // and the mask's gain.
         vec3  cap = 0.76 * display_cap() / max(M, vec3(0.05));
         float mp  = (interlaced ? 2.0 : 1.0) * pc.field_ms / pc.window_ms;
-        scanline_rgb = vec3(0.0);
-        for (int j = 0; j < 5; j++) {
-            vec3 a = lit[j];
-            if (max(a.r, max(a.g, a.b)) <= 0.0) continue;
-            int i = k0 + j - 2 - tl_base;
-            // Lines the table doesn't cover (a tiny output) show their steady light.
-            if (i < 0 || i >= tl_count) { scanline_rgb += a; continue; }
-            vec3  c  = cap / max(a, vec3(1e-4));
-            float m  = tl_m[i];
-            vec3  s1 = tl_s1[i], sa = tl_sa[i], sb = tl_sb[i];
-            // A line passed during this refresh also shows what is left of the pass before, which
-            // fell at the same point of its own refresh.
-            vec3  w  = m < 0.5 ? min(c, s1) + carried_share(mp, sa, sb, s1, c) : carried_share(m, sa, s1, sb, c);
-            scanline_rgb += min(w * a, cap);
-        }
+        scanline_rgb = line_share(k0 - 1, a0, cap, mp) + line_share(k0, a1, cap, mp) + line_share(k0 + 1, a2, cap, mp);
+        if (wide) scanline_rgb += line_share(k0 - 2, b0, cap, mp) + line_share(k0 + 2, b1, cap, mp);
     }
     out_sustained_rgb = scanline_rgb;
 
