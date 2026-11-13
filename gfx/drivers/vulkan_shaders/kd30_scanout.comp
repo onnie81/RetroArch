@@ -41,7 +41,7 @@ layout(push_constant) uniform ScanoutPush {
     uint  signal_standard;  // 0 = NTSC (SMPTE-C / Sony 9300K Red-Push, 59.94Hz), 1 = PAL (EBU P22, 50Hz)
     uint  input_mode;       // 0 = VIDEO 1 Composite (CVBS), 1 = VIDEO 2 S-Video (Y/C), 2 = VIDEO 4 Component/RGB
     uint  osd_mode;         // 0 = Off, 1 = Top-Right Input Banner Only, 2 = Full Interactive WEGA OSD Menu
-    uint  osd_selected_row; // 0..8 selected parameter row in OSD menu
+    uint  osd_selected_row; // 0..9 selected parameter row in OSD menu
     uint  perf_overlay_on;  // 1 = Show compact bottom-right performance telemetry HUD (F key)
     uint  mask_layout;      // 0 = Sony SFP (0.45mm), 1 = Consumer WEGA (0.75mm), 2 = BVM-D24 (0.25mm), 3 = Slot Mask, 4 = Dot-Trio Shadow Mask
     uint  aspect_mode;      // 0 = 4:3 CRT Pillarbox (3:4 in TATE), 1 = 16:9 Wide Tube, 2 = Full Window Stretch
@@ -256,14 +256,14 @@ int menu_char_at(int row, int col) {
         const int hdr[24] = {83,79,78,89,32,75,68,45,51,48,88,83,57,53,53,32,68,65,45,52,32,79,83,68};
         return (c >= 1 && c <= 24) ? hdr[c - 1] : 32;
     }
-    if (row == 10) {
+    if (row == 11) {
         // "G:MASK  A:ASPECT  B:BEAM  "
         const int ftr[26] = {71,58,77,65,83,75,32,32,65,58,65,83,80,69,67,84,32,32,66,58,66,69,65,77,32,32};
         return (c >= 0 && c < 26) ? ftr[c] : 32;
     }
 
     int item = row - 1;
-    if (item < 0 || item > 8) return 32;
+    if (item < 0 || item > 9) return 32;
 
     if (c == 0) return (uint(item) == pc.osd_selected_row) ? 62 : 32;
     if (c == 1) return 32;
@@ -279,6 +279,7 @@ int menu_char_at(int row, int col) {
         if (item == 6) { const int L[12] = {72,45,66,69,65,77,32,66,76,69,78,68}; return L[lc]; } // "H-BEAM BLEND"
         if (item == 7) { const int L[12] = {86,45,66,69,65,77,32,83,73,71,77,65}; return L[lc]; } // "V-BEAM SIGMA"
         if (item == 8) { const int L[12] = {67,82,84,32,87,72,73,84,69,32,32,32}; return L[lc]; } // "CRT WHITE   "
+        if (item == 9) { const int L[12] = {68,73,83,80,76,65,89,32,80,69,65,75}; return L[lc]; } // "DISPLAY PEAK"
     }
     if (c == 14) return 58;
     if (c == 15) return 32;
@@ -314,13 +315,11 @@ int menu_char_at(int row, int col) {
     if (item == 5) return format_float_char(pc.vm_strength, vc);
     if (item == 6) return format_float_char(pc.horiz_smear, vc);
     if (item == 7) return format_float_char(pc.beam_sigma_scale, vc);
-    if (item == 8) {
-        int n = int(clamp(pc.crt_white_nits, 0.0, 999.0));
-        if (vc == 0) return 48 + (n / 100) % 10;
-        if (vc == 1) return 48 + (n / 10) % 10;
-        if (vc == 2) return 48 + n % 10;
-        const int U[6] = {32,78,73,84,83,32};
-        if (vc >= 3 && vc < 9) return U[vc - 3];
+    if (item == 9 && pc.output_mode < 0.5) { const int V[9] = {83,68,82,32,32,32,32,32,32}; return V[vc]; } // "SDR"
+    if (item == 8 || item == 9) {
+        if (vc < 4) return format_uint4_char(uint(item == 8 ? pc.crt_white_nits : pc.display_peak_nits), vc);
+        const int U[5] = {32,78,73,84,83}; // " NITS"
+        return U[vc - 4];
     }
     return 32;
 }
@@ -432,22 +431,22 @@ void evaluate_sony_wega_osd(vec2 uv, inout vec3 out_rgb) {
 
     if (pc.osd_mode == 2u) {
         vec2 m_min = vec2(0.035, 0.065);
-        vec2 m_max = vec2(0.515, 0.625);
+        vec2 m_max = vec2(0.515, 0.676);
         if (uv.x >= m_min.x && uv.x < m_max.x && uv.y >= m_min.y && uv.y < m_max.y) {
             vec2 rel = (uv - m_min) / (m_max - m_min);
             int col = int(rel.x * 28.0);
-            int row = int(rel.y * 11.0);
-            vec2 cell = fract(rel * vec2(28.0, 11.0));
+            int row = int(rel.y * 12.0);
+            vec2 cell = fract(rel * vec2(28.0, 12.0));
             int gx = int(cell.x * 10.5) - 1;
-            int gy = int(cell.y * 11.0) - 1;
+            int gy = int(cell.y * 11.0) - (row == 0 ? 2 : 1);
 
-            bool is_border = (rel.x < 0.010 || rel.x > 0.990 || rel.y < 0.012 || rel.y > 0.988);
+            bool is_border = (rel.x < 0.010 || rel.x > 0.990 || rel.y < 0.011 || rel.y > 0.989);
             if (is_border) {
                 out_rgb = vec3(0.12, 0.82, 0.32);
                 return;
             }
 
-            bool is_selected_row = (row >= 1 && row <= 9 && uint(row - 1) == pc.osd_selected_row);
+            bool is_selected_row = (row >= 1 && row <= 10 && uint(row - 1) == pc.osd_selected_row);
             vec3 panel_bg = is_selected_row ? vec3(0.05, 0.16, 0.22) : vec3(0.02, 0.04, 0.07);
             out_rgb = mix(out_rgb, panel_bg, 0.93);
 
@@ -456,13 +455,14 @@ void evaluate_sony_wega_osd(vec2 uv, inout vec3 out_rgb) {
             if (hit == 2) {
                 if (row == 0) {
                     out_rgb = vec3(1.00, 0.84, 0.18);
-                } else if (row == 10) {
+                } else if (row == 11) {
                     out_rgb = vec3(0.65, 0.88, 0.98);
                 } else if (is_selected_row) {
                     out_rgb = vec3(1.00, 1.00, 0.30);
                 } else {
                     out_rgb = vec3(0.18, 0.96, 0.28);
                 }
+                if (row == 10 && pc.output_mode < 0.5) out_rgb *= 0.65;
             } else if (hit == 1) {
                 out_rgb = vec3(0.0);
             }
