@@ -43,11 +43,14 @@ const int   PER_T   = N_SIG / 256;
 const float TWO_PI  = 6.28318530718;
 const float TUBE_W_MM = 473.3;       // 4:3 active width of the 355 mm-high raster
 const float AMP_MHZ   = 6.0;         // TV video amplifier / cathode drive bandwidth (all inputs)
+const float VM_GAIN   = 2.0;         // VM coil deflection per unit of luma slope, at full strength
+const float VM_PX     = 0.6;         // reach of the VM drive, in source pixels
 
 shared float sY[N_SIG];
 shared float sU[N_SIG];
 shared float sV[N_SIG];
 shared float s_red[256];
+shared float sD[N_SIG];  // ClearEdge VM: where each sample lands, in samples from its place
 
 vec3 beam_sigma_mm(vec3 L) {
     return vec3(0.28) + 0.30 * pow(clamp(L, vec3(0.0), vec3(1.5)), vec3(0.70));
@@ -116,7 +119,7 @@ void main() {
     // ---- 2. Encoder band-limiting: luma ~5.0 MHz amp, chroma 1.3 MHz before modulation ----
     float sig_y_enc = gauss_sigma_samples((pc.input_mode == 2u) ? 8.0 : 5.0, fs_mhz);
     float sig_c_enc = gauss_sigma_samples(1.3, fs_mhz);
-    float rY[PER_T], rU[PER_T], rV[PER_T];
+    float rY[PER_T], rU[PER_T], rV[PER_T], rD[PER_T];
     for (int k = 0; k < PER_T; k++) {
         int i = int(tid) + k * 256;
         GAUSS_FILTER(sY, i, sig_y_enc, rY[k]);
@@ -198,15 +201,27 @@ void main() {
     }
     barrier();
 
+    // ClearEdge VM: an auxiliary deflection coil driven by the luma slope pushes the beam along the line
+    // while the picture brightens and back while it darkens. It speeds through the dark side of an edge
+    // and slows on the bright side, so bright detail lands narrower, with its light gathered into a rim.
     float vm_mode = (pc.input_mode == 2u) ? 1.0 : ((pc.input_mode == 1u) ? 0.8 : 0.55);
     float vm_k    = pc.vm_strength * vm_mode;
-    float sig_vm  = 0.45 * spp;
+    float mm_to_s = spp * raw_w / TUBE_W_MM * pc.horiz_smear;
+    float sig_t   = max(max(sig_amp, 0.45 * mm_to_s), VM_PX * spp);
     for (int k = 0; k < PER_T; k++) {
         int i = int(tid) + k * 256;
-        float y_blur;
-        GAUSS_FILTER(sY, i, sig_vm, y_blur);
-        float y_sharp = rY[k] + vm_k * 0.4 * (rY[k] - y_blur);
-        vec3 rgb = yuv_to_rgb(vec3(y_sharp, rU[k], rV[k]));
+        sD[i] = 0.5 * (sY[min(i + 1, N_SIG - 1)] - sY[max(i - 1, 0)]);
+    }
+    barrier();
+    for (int k = 0; k < PER_T; k++) {
+        int i = int(tid) + k * 256;
+        GAUSS_FILTER(sD, i, sig_t, rD[k]);
+    }
+    barrier();
+    for (int k = 0; k < PER_T; k++) sD[int(tid) + k * 256] = vm_k * VM_GAIN * sig_t * sig_t * rD[k];
+    barrier();
+    for (int k = 0; k < PER_T; k++) {
+        vec3 rgb = yuv_to_rgb(vec3(rY[k], rU[k], rV[k]));
         vec3 lin = to_linear(clamp(rgb, 0.0, 1.08));
         rY[k] = lin.r; rU[k] = lin.g; rV[k] = lin.b;
     }
@@ -237,13 +252,13 @@ void main() {
         float pos = (float(x) + 0.5) / float(pc.scan_size.x) * float(N_ACT) - 0.5 + float(MARGIN);
         int   c0  = int(round(pos));
         vec3  acc = vec3(0.0);
-        float mm_to_s = spp * raw_w / TUBE_W_MM * pc.horiz_smear;
-        int   R    = min(int(ceil(3.0 * 0.70 * mm_to_s)) + 1, 40);
+        int   R    = min(int(ceil(3.0 * 0.70 * mm_to_s + (vm_k > 0.0 ? 1.5 * sig_t : 0.0))) + 1, 48);
         for (int j = -R; j <= R; j++) {
             int i = clamp(c0 + j, 0, N_SIG - 1);
-            vec3 L = vec3(sY[i], sU[i], sV[i]);
-            vec3 sg = max(beam_sigma_mm(L) * mm_to_s, vec3(0.35));
-            vec3 d  = vec3(pos - float(c0 + j));
+            float speed = 1.0 + 0.5 * (sD[min(i + 1, N_SIG - 1)] - sD[max(i - 1, 0)]);
+            vec3 L = vec3(sY[i], sU[i], sV[i]) / max(speed, 0.25);
+            vec3 sg = max(beam_sigma_mm(vec3(sY[i], sU[i], sV[i])) * mm_to_s, vec3(0.35));
+            vec3 d  = vec3(pos - float(c0 + j) - sD[i]);
             acc += L * exp(-0.5 * d * d / (sg * sg)) / (2.50662827 * sg);
         }
         imageStore(uScanlineBuffer, ivec2(int(x), int(line_y)), vec4(acc, line_current));
