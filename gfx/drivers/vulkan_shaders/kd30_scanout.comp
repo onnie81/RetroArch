@@ -40,7 +40,7 @@ layout(push_constant) uniform ScanoutPush {
     uint  scan_format;      // 0 = Progressive (240p/288p), 1 = Interlaced (480i/576i), 2 = 1080i DRC Hi-Scan
     uint  signal_standard;  // 0 = NTSC (SMPTE-C / Sony 9300K Red-Push, 59.94Hz), 1 = PAL (EBU P22, 50Hz)
     uint  input_mode;       // 0 = VIDEO 1 Composite (CVBS), 1 = VIDEO 2 S-Video (Y/C), 2 = VIDEO 4 Component/RGB
-    uint  osd_mode;         // 0 = Off, 1 = Top-Right Input Banner Only, 2 = Full Interactive WEGA OSD Menu
+    uint  osd_mode;         // bits 0-1: 0 = Off, 1 = Top-Right Input Banner Only, 2 = Full Interactive WEGA OSD Menu; disc row: 8-15 disc, 16-23 discs, 24 tray open
     uint  osd_selected_row; // 0..9 selected parameter row in OSD menu
     uint  perf_overlay_on;  // 1 = Show compact bottom-right performance telemetry HUD (F key)
     uint  mask_layout;      // 0 = Sony SFP (0.45mm), 1 = Consumer WEGA (0.75mm), 2 = BVM-D24 (0.25mm), 3 = Slot Mask, 4 = Dot-Trio Shadow Mask
@@ -244,6 +244,20 @@ int banner_char_at(int row, int col) {
         if (col >= 5 && col <= 9) {
             return format_scanlines_char(pc.scan_size.y, pc.scan_format, col - 5);
         }
+    } else if (row == 2) {
+        // "DISC 2/3" and " OPEN" while the tray is open
+        uint d = (pc.osd_mode >> 8) & 255u, n = (pc.osd_mode >> 16) & 255u;
+        const int prefix[5] = {68, 73, 83, 67, 32};
+        if (col < 5) return prefix[col];
+        int dl = d >= 10u ? 2 : 1, nl = n >= 10u ? 2 : 1, p = col - 5;
+        if (p < dl) return 48 + int(dl == 2 && p == 0 ? d / 10u : d % 10u);
+        p -= dl;
+        if (p == 0) return 47;
+        p -= 1;
+        if (p < nl) return 48 + int(nl == 2 && p == 0 ? n / 10u : n % 10u);
+        p -= nl;
+        const int open[5] = {32, 79, 80, 69, 78};
+        if (((pc.osd_mode >> 24) & 1u) != 0u && p < 5) return open[p];
     }
     return 32;
 }
@@ -407,15 +421,16 @@ void evaluate_sony_wega_osd(vec2 uv, inout vec3 out_rgb) {
         }
     }
 
-    if (pc.osd_mode == 0u) return;
+    if ((pc.osd_mode & 3u) == 0u) return;
 
+    float b_rows = ((pc.osd_mode >> 16) & 255u) > 1u ? 3.0 : 2.0;
     vec2 b_min = vec2(0.73, 0.045);
-    vec2 b_max = vec2(0.96, 0.130);
+    vec2 b_max = vec2(0.96, 0.045 + 0.0425 * b_rows);
     if (uv.x >= b_min.x && uv.x < b_max.x && uv.y >= b_min.y && uv.y < b_max.y) {
         vec2 rel = (uv - b_min) / (b_max - b_min);
         int col = int(rel.x * 13.0);
-        int row = int(rel.y * 2.0);
-        vec2 cell = fract(rel * vec2(13.0, 2.0));
+        int row = int(rel.y * b_rows);
+        vec2 cell = fract(rel * vec2(13.0, b_rows));
         int gx = int(cell.x * 10.5) - 1;
         int gy = int(cell.y * 11.0) - 1;
         int ch = banner_char_at(row, col);
@@ -429,7 +444,7 @@ void evaluate_sony_wega_osd(vec2 uv, inout vec3 out_rgb) {
         }
     }
 
-    if (pc.osd_mode == 2u) {
+    if ((pc.osd_mode & 3u) == 2u) {
         vec2 m_min = vec2(0.035, 0.065);
         vec2 m_max = vec2(0.515, 0.676);
         if (uv.x >= m_min.x && uv.x < m_max.x && uv.y >= m_min.y && uv.y < m_max.y) {
