@@ -621,11 +621,10 @@ float display_cap() {
 }
 
 // Aperture mask as a factor on the beam's light; stripes and dots widen with the beam level.
-vec3 mask_factor(vec3 level, float effective_zoom, float total_triads, float inst_freq_scale, float triad_coord,
+vec3 mask_factor(vec3 level, float effective_zoom, float d_triad, float triad_coord,
                  float triad_idx, float triad_phase, float scan_y_for_mask) {
-    // Evaluate Selected Phosphor Grille / Mask Layout (0..4) with Horizontal Lumina Expansion:
-    float effective_res_x = float(pc.output_size.x) * max(effective_zoom, 1.0);
-    float d_triad = (total_triads * inst_freq_scale) / effective_res_x;
+    // Evaluate Selected Phosphor Grille / Mask Layout (0..4) with Horizontal Lumina Expansion.
+    // d_triad: triads per output pixel.
     float macro_blend = clamp((effective_zoom - 1.5) / 4.0, 0.0, 1.0);
 
     if (pc.mask_layout <= 2u) {
@@ -735,13 +734,22 @@ LineTiming line_timing(int k) {
 }
 
 // The tube's position after the high-voltage breathing, as evaluate_crt_raster_at places it.
-vec2 breathing_uv(vec2 uv_in) {
+// How much the raster shrinks under high-voltage sag at this point of the glass (1 = none).
+float breathing_scale(vec2 uv_in) {
     float num_lines    = float(pc.scan_size.y);
     float line_idx_raw = clamp(floor(uv_in.y * num_lines), 0.0, num_lines - 1.0);
     float line_curr    = texture(uScanlineTex, vec2(0.5, (line_idx_raw + 0.5) / num_lines)).a;
     float frame_curr   = texture(uScanlineTex, vec2(0.5, 0.5)).a;
-    float hv_sag       = mix(frame_curr, line_curr, 0.65) * pc.hv_breathing;
-    return (uv_in - 0.5) / (1.0 + hv_sag) + 0.5;
+    return 1.0 / (1.0 + mix(frame_curr, line_curr, 0.65) * pc.hv_breathing);
+}
+vec2 breathing_uv(vec2 uv_in) { return (uv_in - 0.5) * breathing_scale(uv_in) + 0.5; }
+
+// The tube's size in output pixels.
+vec2 tube_size_px() {
+    float win_aspect = float(pc.output_size.x) / float(max(pc.output_size.y, 1u));
+    float t = tube_aspect();
+    return t < win_aspect ? vec2(float(pc.output_size.y) * t, float(pc.output_size.y))
+                          : vec2(float(pc.output_size.x), float(pc.output_size.x) / t);
 }
 
 // Line timing depends only on the line, so each workgroup works it out once for the lines its rows
@@ -814,7 +822,8 @@ vec3 line_share(int k, vec3 a, vec3 cap, float mp) {
 
 vec3 evaluate_crt_raster_at(vec2 uv_in, float effective_zoom, bool use_table, out vec3 out_sustained_rgb) {
     float num_lines = float(pc.scan_size.y);
-    vec2 uv = breathing_uv(uv_in);
+    float b_scale = breathing_scale(uv_in);
+    vec2 uv = (uv_in - 0.5) * b_scale + 0.5;
     if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) {
         out_sustained_rgb = vec3(0.0);
         return vec3(0.0);
@@ -837,34 +846,47 @@ vec3 evaluate_crt_raster_at(vec2 uv_in, float effective_zoom, bool use_table, ou
         has_damper_wires = false;
     }
 
-    float u_sym = uv.x * 2.0 - 1.0;
-    const float alpha_edge = 0.065;
-    float x_grille = 0.5 + 0.5 * (u_sym - (alpha_edge / 3.0) * u_sym * u_sym * u_sym) / (1.0 - alpha_edge / 3.0);
-    float inst_freq_scale = (1.0 - alpha_edge * u_sym * u_sym) / (1.0 - alpha_edge / 3.0);
-
-    // Calibrated physical triad count across the 4:3 active raster:
-    // At 0.45mm SFP pitch -> ~640 triads (~2.0 RGB triads = 6 sub-pixel phosphor stripes per 320px column);
-    // At 0.72mm WEGA pitch -> ~480 triads (~1.5 RGB triads per 320px column, matching macro CRT photos!)
+    // The mask is fixed to the glass, so its coordinates come from the screen position (uv_in), not the
+    // breathing raster. A triad only a few screen pixels wide is drawn a whole number of pixels wide
+    // and evenly spaced: a non-whole width, or the grille pitch widening toward the edges, beats
+    // against the pixel grid (moiré). Three pixels is the least that still shows the stripes; a triad
+    // under 2.25 pixels gets two. The magnifier shows the true, graded pitch.
     uint  am           = pc.aspect_mode & 255u;
     float raster_w_mm  = TUBE_H_MM * (am == 1u ? 16.0 / 9.0 : am >= 3u ? tube_aspect() : 4.0 / 3.0);
-    float total_triads = raster_w_mm / max(eff_pitch_mm, 0.18);
+    vec2  tube_px      = tube_size_px() * max(effective_zoom, 1.0);
+    float phys_triads  = raster_w_mm / max(eff_pitch_mm, 0.18);
+    float px_triad     = tube_px.x / phys_triads;
+    bool  px_locked    = effective_zoom <= 1.0 && px_triad < 8.0;
+    float total_triads = px_locked ? tube_px.x / (px_triad >= 2.25 ? max(3.0, round(px_triad)) : 2.0) : phys_triads;
+    float u_sym = uv_in.x * 2.0 - 1.0;
+    const float alpha_edge = 0.065;
+    float x_grille = px_locked ? uv_in.x : 0.5 + 0.5 * (u_sym - (alpha_edge / 3.0) * u_sym * u_sym * u_sym) / (1.0 - alpha_edge / 3.0);
+    float inst_freq_scale = px_locked ? 1.0 : (1.0 - alpha_edge * u_sym * u_sym) / (1.0 - alpha_edge / 3.0);
+    float d_triad      = total_triads * inst_freq_scale / tube_px.x;
     float triad_coord  = x_grille * total_triads;
     float triad_idx    = floor(triad_coord);
     float triad_phase  = triad_coord - triad_idx;
 
-    // Exact sub-pixel horizontal coordinates of the nearest Red (1/6), Green (3/6), and Blue (5/6) phosphor stripes:
+    // The beam is sampled at the nearest red (1/6), green (3/6) and blue (5/6) stripes, carried from the
+    // glass to the raster.
     float near_r_idx = floor(triad_coord - 0.1666667 + 0.5) + 0.1666667;
     float near_g_idx = floor(triad_coord - 0.5000000 + 0.5) + 0.5000000;
     float near_b_idx = floor(triad_coord - 0.8333333 + 0.5) + 0.8333333;
-    float u_r = clamp(near_r_idx / total_triads, 0.0, 1.0);
-    float u_g = clamp(near_g_idx / total_triads, 0.0, 1.0);
-    float u_b = clamp(near_b_idx / total_triads, 0.0, 1.0);
+    float u_r = clamp((near_r_idx / total_triads - 0.5) * b_scale + 0.5, 0.0, 1.0);
+    float u_g = clamp((near_g_idx / total_triads - 0.5) * b_scale + 0.5, 0.0, 1.0);
+    float u_b = clamp((near_b_idx / total_triads - 0.5) * b_scale + 0.5, 0.0, 1.0);
+
+    // Mask rows (slot and dot masks), whole pixels tall on the same terms; the dot mask's rows are
+    // 0.866 of a pitch apart.
+    float row_unit = eff_pitch_mm * (pc.mask_layout == 4u ? 0.8660254 : 1.0);
+    float row_px   = tube_px.y * row_unit / TUBE_H_MM;
+    float rows     = px_locked ? tube_px.y / max(2.0, round(row_px)) : TUBE_H_MM / row_unit;
+    float scan_y_for_mask = uv_in.y * rows * (pc.mask_layout == 4u ? 0.8660254 : 1.0);
 
     // Raster: one beam trace per source line (progressive: all lines each field; interlaced: the
     // source frame is the weave of the last two fields, so each line sits at its frame position).
     // Spot size is physical (mm on the tube); each trace is energy-normalised so a flat field
     // averages to the drive level regardless of spot size or line pitch.
-    float scan_y_for_mask = uv.y * TUBE_H_MM / max(eff_pitch_mm, 0.18);
     float pitch_mm = TUBE_H_MM / num_lines;
     float y_lines  = uv.y * num_lines;
     int   k0       = int(floor(y_lines));
@@ -883,7 +905,7 @@ vec3 evaluate_crt_raster_at(vec2 uv_in, float effective_zoom, bool use_table, ou
         int reach = wide ? 2 : 1;
         for (int j = -reach; j <= reach; j++)
             scanline_rgb += line_light(k0 + j, false, y_lines, pitch_mm, waist, u_r, u_g, u_b);
-        M = mask_factor(scanline_rgb, effective_zoom, total_triads, inst_freq_scale, triad_coord, triad_idx, triad_phase,
+        M = mask_factor(scanline_rgb, effective_zoom, d_triad, triad_coord, triad_idx, triad_phase,
                         scan_y_for_mask);
     } else {
         // Each line as its latest pass left it: lines the beam hasn't reached yet, and when
@@ -896,7 +918,7 @@ vec3 evaluate_crt_raster_at(vec2 uv_in, float effective_zoom, bool use_table, ou
             b0 = line_light(k0 - 2, line_prev(k0 - 2), y_lines, pitch_mm, waist, u_r, u_g, u_b);
             b1 = line_light(k0 + 2, line_prev(k0 + 2), y_lines, pitch_mm, waist, u_r, u_g, u_b);
         }
-        M = mask_factor(a0 + a1 + a2 + b0 + b1, effective_zoom, total_triads, inst_freq_scale, triad_coord, triad_idx, triad_phase,
+        M = mask_factor(a0 + a1 + a2 + b0 + b1, effective_zoom, d_triad, triad_coord, triad_idx, triad_phase,
                         scan_y_for_mask);
         // Most a refresh can show here before the mask: the output's knee over the colour matrix
         // and the mask's gain.
