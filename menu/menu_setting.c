@@ -14054,14 +14054,14 @@ static const setting_desc_t dingux_rs90_desc[] = {
 static size_t setting_get_string_representation_uint_video_kd30_mask(
       rarch_setting_t *setting, char *s, size_t len)
 {
-   static const char *names[5] = {
-      "Sony SFP 0.45 mm", "WEGA 0.75 mm", "BVM 0.25 mm",
-      "Slot Mask", "Dot-Trio Shadow Mask" };
+   static const char *names[6] = {
+      "Sony SFP 0.45 mm", "WEGA 0.75 mm", "BVM-D24E1WU 0.25-0.28 mm",
+      "Slot Mask", "Dot-Trio Shadow Mask", "BVM-D32E1WU 0.32-0.36 mm" };
    unsigned v;
    if (!setting)
       return 0;
    v = *setting->value.target.unsigned_integer;
-   return strlcpy(s, names[v < 5 ? v : 0], len);
+   return strlcpy(s, names[v < 6 ? v : 0], len);
 }
 
 static size_t setting_get_string_representation_uint_video_kd30_input(

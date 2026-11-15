@@ -58,7 +58,7 @@ layout(push_constant) uniform ScanoutPush {
     uint  osd_mode;         // bits 0-1: 0 = Off, 1 = Top-Right Input Banner Only, 2 = Full Interactive WEGA OSD Menu; 4-5 persistence (P22, MEDIUM, LONG, ADAPTIVE), 6 beam on; disc row: 8-15 disc, 16-23 discs, 24 tray open
     uint  osd_selected_row; // 0..9 selected parameter row in OSD menu
     uint  perf_overlay_on;  // 1 = Show compact bottom-right performance telemetry HUD (F key)
-    uint  mask_layout;      // 0 = Sony SFP (0.45mm), 1 = Consumer WEGA (0.75mm), 2 = BVM-D24 (0.25mm), 3 = Slot Mask, 4 = Dot-Trio Shadow Mask
+    uint  mask_layout;      // 0 = Sony SFP (0.45mm), 1 = Consumer WEGA (0.75mm), 2 = BVM-D24E1WU, 3 = Slot Mask, 4 = Dot-Trio Shadow Mask, 5 = BVM-D32E1WU
     uint  aspect_mode;      // bits 0-7: 0 = 4:3 CRT Pillarbox (3:4 in TATE), 1 = 16:9 Wide Tube, 2 = Full Window Stretch, 3 = core's aspect (bits 8-31, x4096), 4 = square pixels
     float sfp_pitch_mm;     // Aperture grille pitch control (0.45 default)
     float hv_breathing;     // 0.005 DA-4 HV regulation sag
@@ -349,7 +349,8 @@ int menu_char_at(int row, int col) {
     if (item == 4) {
         if (pc.mask_layout == 0u) { const int V[9] = {83,79,78,89,32,83,70,80,32}; return V[vc]; } // "SONY SFP "
         if (pc.mask_layout == 1u) { const int V[9] = {87,69,71,65,32,48,46,55,53}; return V[vc]; } // "WEGA 0.75"
-        if (pc.mask_layout == 2u) { const int V[9] = {66,86,77,32,48,46,50,53,32}; return V[vc]; } // "BVM 0.25 "
+        if (pc.mask_layout == 2u) { const int V[9] = {66,86,77,45,68,50,52,32,32}; return V[vc]; } // "BVM-D24  "
+        if (pc.mask_layout == 5u) { const int V[9] = {66,86,77,45,68,51,50,32,32}; return V[vc]; } // "BVM-D32  "
         if (pc.mask_layout == 3u) { const int V[9] = {83,76,79,84,32,77,65,83,75}; return V[vc]; } // "SLOT MASK"
         const int V[9] = {68,79,84,32,84,82,73,79,32}; return V[vc];                               // "DOT TRIO "
     }
@@ -601,7 +602,7 @@ vec3 beam_sigma_mm(vec3 L) {
 // (dark drive, full drive): tight on a BVM, softest on a dot mask.
 vec2 spot_gap_ratio(uint mask) {
     if (mask == 1u) return vec2(0.22, 0.40);
-    if (mask == 2u) return vec2(0.17, 0.33);
+    if (mask == 2u || mask == 5u) return vec2(0.17, 0.33);
     if (mask == 3u) return vec2(0.24, 0.42);
     if (mask == 4u) return vec2(0.25, 0.44);
     return vec2(0.20, 0.38);
@@ -645,7 +646,7 @@ vec3 mask_factor(vec3 level, float effective_zoom, float d_triad, float triad_co
     // d_triad: triads per output pixel.
     float macro_blend = clamp((effective_zoom - 1.5) / 4.0, 0.0, 1.0);
 
-    if (pc.mask_layout <= 2u) {
+    if (pc.mask_layout <= 2u || pc.mask_layout == 5u) {
         // Horizontal Lumina Expansion: strongly excited phosphor stripes expand their effective
         // crystal duty cycle across the black carbon guard band (from 0.24 at dark up to 0.38 at peak)!
         vec3 duty = clamp(vec3(0.24) + 0.14 * pow(clamp(level, vec3(0.0), vec3(1.4)), vec3(0.75)), vec3(0.23), vec3(0.39));
@@ -689,7 +690,7 @@ vec3 mask_factor(vec3 level, float effective_zoom, float d_triad, float triad_co
 
         // At 1x scale, blend between gentle eye-integrated triad contrast and full macro stripes based on pixel density
         float grille_strength_1x = pc.mask_strength > 0.0 ? pc.mask_strength
-                                 : ((pc.mask_layout == 1u) ? 0.38 : ((pc.mask_layout == 2u) ? 0.18 : 0.28));
+                                 : ((pc.mask_layout == 1u) ? 0.38 : ((pc.mask_layout == 2u || pc.mask_layout == 5u) ? 0.18 : 0.28));
         float blend_to_full = mix(grille_strength_1x, 1.0, macro_blend);
         vec3 eff_grille = mix(vec3(1.0), grille_full, blend_to_full);
 
@@ -728,7 +729,7 @@ vec3 mask_factor(vec3 level, float effective_zoom, float d_triad, float triad_co
 // stripes), so the flicker limit set from it is the same across a triad.
 float mask_peak(float effective_zoom, float d_triad) {
     float macro_blend = clamp((effective_zoom - 1.5) / 4.0, 0.0, 1.0);
-    if (pc.mask_layout <= 2u) {
+    if (pc.mask_layout <= 2u || pc.mask_layout == 5u) {
         float px1, px2, px3;
         if (pc.subpixel_layout > 0.5) {
             float w = 3.14159265 * d_triad / 3.0;
@@ -746,7 +747,7 @@ float mask_peak(float effective_zoom, float d_triad) {
                              + abs(sin(6.28318530 * duty) / (6.28318530 * duty)) * 0.6366 * abs(px2)
                              + abs(sin(9.42477796 * duty) / (9.42477796 * duty)) * 0.3001 * abs(px3));
         float strength = pc.mask_strength > 0.0 ? pc.mask_strength
-                       : ((pc.mask_layout == 1u) ? 0.38 : ((pc.mask_layout == 2u) ? 0.18 : 0.28));
+                       : ((pc.mask_layout == 1u) ? 0.38 : ((pc.mask_layout == 2u || pc.mask_layout == 5u) ? 0.18 : 0.28));
         float blend = mix(strength, 1.0, macro_blend);
         return mix(1.0, g, blend) + 0.1 * blend;
     }
@@ -925,8 +926,10 @@ vec3 evaluate_crt_raster_at(vec2 uv_in, float effective_zoom, bool use_table, ou
 
     if (pc.mask_layout == 1u) {
         eff_pitch_mm = max(pc.sfp_pitch_mm, 0.72); // Consumer WEGA (~1.5 triads per Genesis pixel)
-    } else if (pc.mask_layout == 2u) {
-        eff_pitch_mm = 0.30;                       // Sony BVM-D24 Master Monitor (~3.0 triads per pixel)
+    } else if (pc.mask_layout == 2u || pc.mask_layout == 5u) {
+        // BVM-D24E1WU: 0.25-0.28 mm on a 482.1 mm wide picture; BVM-D32E1WU: 0.32-0.36 mm on 655.2 mm.
+        // Drawn on this raster as the same number of stripes across the picture (mean pitch).
+        eff_pitch_mm = TUBE_H_MM * (16.0 / 9.0) * (pc.mask_layout == 2u ? 0.2595 / 482.1 : 0.3322 / 655.2);
         bvm_waist_scale = 0.82;
     } else if (pc.mask_layout == 3u) {
         eff_pitch_mm = 0.62;                       // Staggered Slot Mask
@@ -949,7 +952,7 @@ vec3 evaluate_crt_raster_at(vec2 uv_in, float effective_zoom, bool use_table, ou
     bool  px_locked    = effective_zoom <= 1.0 && px_triad < 8.0;
     float total_triads = px_locked ? tube_px.x / (px_triad >= 2.25 ? max(3.0, round(px_triad)) : 2.0) : phys_triads;
     float u_sym = uv_in.x * 2.0 - 1.0;
-    const float alpha_edge = 0.065;
+    float alpha_edge = (pc.mask_layout == 2u || pc.mask_layout == 5u) ? 0.11 : 0.065;
     float x_grille = px_locked ? uv_in.x : 0.5 + 0.5 * (u_sym - (alpha_edge / 3.0) * u_sym * u_sym * u_sym) / (1.0 - alpha_edge / 3.0);
     float inst_freq_scale = px_locked ? 1.0 : (1.0 - alpha_edge * u_sym * u_sym) / (1.0 - alpha_edge / 3.0);
     float d_triad      = total_triads * inst_freq_scale / tube_px.x;

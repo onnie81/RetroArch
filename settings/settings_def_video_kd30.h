@@ -9,7 +9,7 @@ S_BOOL(video_kd30, VIDEO_KD30,
       "Show the game on a simulated Sony KD-30XS955 tube instead of the shader chain. Vulkan only.")
 S_UINT(video_kd30_mask, VIDEO_KD30_MASK,
       "video_kd30_mask",
-      DEFAULT_VIDEO_KD30_MASK, SD_FLAG_NONE, SDESC_RANGE_MINMAX, CMD_EVENT_NONE, 0, 4, 1, 0, setting_action_ok_uint, setting_get_string_representation_uint_video_kd30_mask,
+      DEFAULT_VIDEO_KD30_MASK, SD_FLAG_NONE, SDESC_RANGE_MINMAX, CMD_EVENT_NONE, 0, 5, 1, 0, setting_action_ok_uint, setting_get_string_representation_uint_video_kd30_mask,
       "KD-30 Phosphor Mask",
       "Phosphor layout of the simulated tube.")
 S_BOOL(video_kd30_beam, VIDEO_KD30_BEAM,
