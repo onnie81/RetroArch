@@ -723,6 +723,43 @@ vec3 mask_factor(vec3 level, float effective_zoom, float d_triad, float triad_co
     }
 }
 
+#ifdef KD30_WEB
+// The most the mask passes anywhere in a triad (at its stripe or dot centres, for the narrowest
+// stripes), so the flicker limit set from it is the same across a triad.
+float mask_peak(float effective_zoom, float d_triad) {
+    float macro_blend = clamp((effective_zoom - 1.5) / 4.0, 0.0, 1.0);
+    if (pc.mask_layout <= 2u) {
+        float px1, px2, px3;
+        if (pc.subpixel_layout > 0.5) {
+            float w = 3.14159265 * d_triad / 3.0;
+            px1 = (sin(w) / max(w, 1e-4)) * smoothstep(0.50, 0.36, d_triad);
+            px2 = (sin(2.0 * w) / max(2.0 * w, 1e-4)) * smoothstep(0.25, 0.18, d_triad);
+            px3 = (sin(3.0 * w) / max(3.0 * w, 1e-4)) * smoothstep(0.1667, 0.12, d_triad);
+        } else {
+            float a1 = 3.14159265 * min(d_triad, 1.0), a2 = 6.28318530 * min(d_triad, 0.5), a3 = 9.42477796 * min(d_triad, 0.3333);
+            px1 = (sin(a1) / max(a1, 1e-4)) * smoothstep(0.92, 0.18, d_triad);
+            px2 = (sin(a2) / max(a2, 1e-4)) * smoothstep(0.50, 0.14, d_triad);
+            px3 = (sin(a3) / max(a3, 1e-4)) * smoothstep(0.33, 0.09, d_triad);
+        }
+        const float duty = 0.23;
+        float g = 1.0 + 2.0 * (sin(3.14159265 * duty) / (3.14159265 * duty) * 0.9003 * max(px1, 0.0)
+                             + abs(sin(6.28318530 * duty) / (6.28318530 * duty)) * 0.6366 * abs(px2)
+                             + abs(sin(9.42477796 * duty) / (9.42477796 * duty)) * 0.3001 * abs(px3));
+        float strength = pc.mask_strength > 0.0 ? pc.mask_strength
+                       : ((pc.mask_layout == 1u) ? 0.38 : ((pc.mask_layout == 2u) ? 0.18 : 0.28));
+        float blend = mix(strength, 1.0, macro_blend);
+        return mix(1.0, g, blend) + 0.1 * blend;
+    }
+    if (pc.mask_layout == 3u) {
+        float a1 = 3.14159265 * min(d_triad, 1.0);
+        float px1 = (sin(a1) / max(a1, 1e-4)) * smoothstep(0.90, 0.20, d_triad);
+        return max(1.0, 0.88 + (0.30 + 0.55 * macro_blend) * abs(px1));
+    }
+    float dot_vis = smoothstep(0.90, 0.20, d_triad) * (0.35 + 0.58 * macro_blend);
+    return mix(1.0, 1.65, dot_vis);
+}
+#endif
+
 #ifndef KD30_WEB
 // Beam timing of scan line k for this refresh: whether it still shows the previous picture, the
 // refreshes since its latest pass (m), and that pass's light by the end of this refresh (s1). For a
@@ -827,7 +864,8 @@ vec3 line_light(int k, bool prev, float y_lines, float pitch_mm, float waist, fl
 
 #ifdef KD30_WEB
 // Stage 1: the brightest of this field's lines reaching this point, at its centre and through the
-// mask here; stage 2 keeps a line's flicker within the display's peak by it, the same along the line.
+// mask's peak; stage 2 keeps a line's flicker within the display's peak by it, the same along the line
+// and across a triad.
 float g_line_peak = 0.0;
 float line_peak(int k, float pitch_mm, float waist, float u_r, float u_g, float u_b) {
     if (k < 0 || k >= int(pc.scan_size.y)) return 0.0;
@@ -974,7 +1012,7 @@ vec3 evaluate_crt_raster_at(vec2 uv_in, float effective_zoom, bool use_table, ou
         M = mask_factor(level, effective_zoom, d_triad, triad_coord, triad_idx, triad_phase,
                         scan_y_for_mask);
 #ifdef KD30_WEB
-        if (KD_FIELD) g_line_peak *= max(M.r, max(M.g, M.b));
+        if (KD_FIELD) g_line_peak *= mask_peak(effective_zoom, d_triad);
 #endif
     }
 #ifndef KD30_WEB
