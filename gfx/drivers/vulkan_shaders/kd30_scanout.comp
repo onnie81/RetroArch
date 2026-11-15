@@ -89,6 +89,8 @@ layout(push_constant) uniform ScanoutPush {
     float beam_alt;         // stage 2 with a pass every two refreshes: alternation depth 0..1, else -1
     float ready_rows;       // stage 1: first row to draw; stage 2: rows from here on of parity ready_par
     float ready_par;        //   still hold the field before (stage 1 draws a field over two refreshes)
+    float miss_comp;        // stage 2: the refresh before was missed (its window shown twice)
+    float flicker_scale;    // stage 2: flicker depth the display's missed refreshes leave room for
 #endif
 } pc;
 
@@ -1130,6 +1132,21 @@ void stage2_share(float t0, float period, out vec3 now, out vec3 before) {
     if (period < 3.0 * W) { now += before; before = vec3(0.0); }
 }
 
+// Shares of the latest pass and of those before. After a missed refresh the screen held the window
+// before it twice and never showed the next, so this refresh also carries what that one should have
+// shown less the repeat.
+void s2_shares(float t0, float P, out vec3 w, out vec3 b) {
+    stage2_share(t0, P, w, b);
+    if (pc.miss_comp > 0.5) {
+        vec3 w1, b1, w2, b2;
+        stage2_share(t0 + pc.window_ms, P, w1, b1);
+        stage2_share(t0 + 2.0 * pc.window_ms, P, w2, b2);
+        vec3 nb = b + b1 - b2;
+        w = max(w + w1 - w2 + min(nb, vec3(0.0)), vec3(0.0));
+        b = max(nb, vec3(0.0));
+    }
+}
+
 // The timing shares depend only on the row, so each workgroup row works them out once: each parity's
 // latest pass reached this row at its scan start plus its place in the scan; the other parity's pass
 // was a field earlier.
@@ -1143,8 +1160,8 @@ void fill_stage2_row(vec2 tube_uv) {
         vec3  w0 = vec3(1.0), w1 = vec3(1.0), b0 = vec3(0.0), b1 = vec3(0.0);
         if (!(il && pc.beam_alt >= 0.0) && W > 0.0 && F > 0.0) {
             float t0 = pc.cur_start_ms + clamp(tube_uv.y, 0.0, 1.0) * F * 0.92;
-            stage2_share(t0 - (il && odd ? F : 0.0), P, w0, b0);
-            if (il) stage2_share(t0 - (odd ? 0.0 : F), P, w1, b1);
+            s2_shares(t0 - (il && odd ? F : 0.0), P, w0, b0);
+            if (il) s2_shares(t0 - (odd ? 0.0 : F), P, w1, b1);
         }
         uint r = gl_LocalInvocationID.y;
         s2_row[r][0] = w0; s2_row[r][1] = b0; s2_row[r][2] = w1; s2_row[r][3] = b1;
@@ -1188,6 +1205,7 @@ vec3 stage2_light(ivec2 px, vec2 tube_uv) {
     vec3  B0 = p0.rgb, B1 = p1.rgb;
     float m  = max(f0.a, f1.a);
     float d  = pk > 1.001 ? clamp((0.8 * display_cap() / max(m, 1e-4) - 1.0) / (pk - 1.0), 0.0, 1.0) : 0.0;
+    d *= pc.flicker_scale;
     vec3  timed  = S0 * w0 + B0 * b0 + S1 * w1 + B1 * b1;
     return tube_matrix(mix(S0 + S1, timed, d));
 }
