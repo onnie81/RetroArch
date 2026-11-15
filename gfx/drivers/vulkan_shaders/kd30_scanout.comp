@@ -10,6 +10,13 @@ const bool KD_BEAM = false;
 #else
 layout(constant_id = 0) const bool KD_BEAM = false;
 #endif
+// The web beam runs in two stages: stage 1 (KD30_FIELD) puts one field's light on the glass at the
+// console's vsync, stage 2 (KD30_BEAM) shows the glass at each display refresh.
+#if defined(KD30_WEB) && defined(KD30_FIELD)
+const bool KD_FIELD = true;
+#else
+const bool KD_FIELD = false;
+#endif
 
 #ifdef KD30_WEB
 layout(set = 0, binding = 0) uniform texture2D uScanTex;
@@ -20,9 +27,12 @@ layout(set = 0, binding = 5) uniform sampler uSamp;
 #define uRawWindowTex sampler2D(uRawTex, uSamp)
 #define uScanlinePrevTex sampler2D(uScanPrevTex, uSamp)
 #ifdef KD30_BEAM
-// Persistence: the light the previous refresh showed, and this refresh's for the next.
-layout(set = 0, binding = 3) uniform texture2D uAccumPrevTex;
-layout(set = 0, binding = 7, rgba16f) uniform writeonly image2D uAccumOut;
+// The light the latest pass of the even and of the odd lines left on the glass (stage 1), and the
+// pass before.
+layout(set = 0, binding = 3) uniform texture2D uField0Tex;
+layout(set = 0, binding = 7) uniform texture2D uField1Tex;
+layout(set = 0, binding = 8) uniform texture2D uField0PrevTex;
+layout(set = 0, binding = 9) uniform texture2D uField1PrevTex;
 #endif
 #else
 layout(set = 0, binding = 0) uniform sampler2D uScanlineTex;
@@ -75,6 +85,9 @@ layout(push_constant) uniform ScanoutPush {
     float panel_tau_ms;     // host panel pixel response (first-order); 0 = ideal
     float subpixel_layout;  // host panel subpixels: 0 = treat pixels as points, 1 = RGB stripe, 2 = BGR stripe
     float mask_strength;    // aperture grille contrast at 1x; 0 = per-layout default
+#ifdef KD30_WEB
+    float beam_alt;         // stage 2 with a pass every two refreshes: alternation depth 0..1, else -1
+#endif
 } pc;
 
 uvec2 pack8x8(uint r0, uint r1, uint r2, uint r3, uint r4, uint r5, uint r6, uint r7) {
@@ -705,6 +718,7 @@ vec3 mask_factor(vec3 level, float effective_zoom, float d_triad, float triad_co
     }
 }
 
+#ifndef KD30_WEB
 // Beam timing of scan line k for this refresh: whether it still shows the previous picture, the
 // refreshes since its latest pass (m), and that pass's light by the end of this refresh (s1). For a
 // line passed during this refresh, sa and sb are the pass before's light by the start and end of it;
@@ -733,6 +747,8 @@ LineTiming line_timing(int k) {
     return t;
 }
 
+#endif
+
 // The tube's position after the high-voltage breathing, as evaluate_crt_raster_at places it.
 // How much the raster shrinks under high-voltage sag at this point of the glass (1 = none).
 float breathing_scale(vec2 uv_in) {
@@ -752,6 +768,7 @@ vec2 tube_size_px() {
                           : vec2(float(pc.output_size.x), float(pc.output_size.x) / t);
 }
 
+#ifndef KD30_WEB
 // Line timing depends only on the line, so each workgroup works it out once for the lines its rows
 // cover (rows map to lines independently of x).
 const int KD_TABLE = 48;
@@ -789,6 +806,8 @@ void fill_line_table(vec2 tube_uv) {
     barrier();
 }
 
+#endif
+
 // One scan line's light at a point, from the picture its latest pass showed.
 vec3 line_light(int k, bool prev, float y_lines, float pitch_mm, float waist, float u_r, float u_g, float u_b) {
     if (k < 0 || k >= int(pc.scan_size.y)) return vec3(0.0);
@@ -801,6 +820,19 @@ vec3 line_light(int k, bool prev, float y_lines, float pitch_mm, float waist, fl
     return L * (pitch_mm / (2.5066283 * sg)) * exp(-0.5 * d * d / (sg * sg));
 }
 
+#ifdef KD30_WEB
+// Stage 1: the brightest of this field's lines reaching this point, at its centre and through the
+// mask here; stage 2 keeps a line's flicker within the display's peak by it, the same along the line.
+float g_line_peak = 0.0;
+float line_peak(int k, float pitch_mm, float waist, float u_r, float u_g, float u_b) {
+    if (k < 0 || k >= int(pc.scan_size.y)) return 0.0;
+    vec3 L  = sample_subpixel_phosphor_line(KD_CUR, u_r, u_g, u_b, (float(k) + 0.5) / float(pc.scan_size.y));
+    vec3 pk = L * (pitch_mm / (2.5066283 * spot_sigma_mm(L, pitch_mm, waist)));
+    return max(pk.r, max(pk.g, pk.b));
+}
+#endif
+
+#ifndef KD30_WEB
 bool line_prev(int k) {
     int i = k - tl_base;
     return i >= 0 && i < tl_count && tl_prev[i] > 0.5;
@@ -818,6 +850,21 @@ vec3 line_share(int k, vec3 a, vec3 cap, float mp) {
     vec3  s1 = tl_s1[i], sa = tl_sa[i], sb = tl_sb[i];
     vec3  w  = m < 0.5 ? min(c, s1) + carried_share(mp, sa, sb, s1, c) : carried_share(m, sa, s1, sb, c);
     return min(w * a, cap);
+}
+#endif
+
+vec3 tube_matrix(vec3 c) {
+    const mat3 sony_ntsc_p22 = mat3(
+        1.05, -0.03, -0.02,
+       -0.02,  1.03, -0.01,
+       -0.01, -0.02,  1.04
+    );
+    const mat3 sony_pal_ebu = mat3(
+        1.02, -0.01, -0.01,
+       -0.01,  1.02, -0.01,
+        0.00, -0.01,  1.01
+    );
+    return max(vec3(0.0), (pc.signal_standard == 0u ? sony_ntsc_p22 : sony_pal_ebu) * c);
 }
 
 vec3 evaluate_crt_raster_at(vec2 uv_in, float effective_zoom, bool use_table, out vec3 out_sustained_rgb) {
@@ -896,18 +943,37 @@ vec3 evaluate_crt_raster_at(vec2 uv_in, float effective_zoom, bool use_table, ou
     // other field when interlaced: there the other field's lines are the previous field decaying.
     // The magnifier shows the time-averaged picture. A spot is at most 0.44 of the line pitch wide
     // unless its size is raised, so lines 1.5 pitches away add under 0.3%: three lines reach a point.
+#ifdef KD30_WEB
+    bool  timed = false;
+#else
     bool  timed = KD_BEAM && use_table && pc.window_ms > 0.0 && pc.field_ms > 0.0;
+#endif
     bool  wide  = pc.beam_sigma_scale > 1.15;
     float waist = bvm_waist_scale;
     vec3  scanline_rgb = vec3(0.0);
     vec3  M;
     if (!timed) {
+        // Stage 1 of an interlaced scan keeps this field's lines; the other field's (the field before)
+        // only add to how far the spots spread into the mask.
         int reach = wide ? 2 : 1;
-        for (int j = -reach; j <= reach; j++)
-            scanline_rgb += line_light(k0 + j, false, y_lines, pitch_mm, waist, u_r, u_g, u_b);
-        M = mask_factor(scanline_rgb, effective_zoom, d_triad, triad_coord, triad_idx, triad_phase,
+        vec3 level = vec3(0.0);
+        for (int j = -reach; j <= reach; j++) {
+            bool other = KD_FIELD && interlaced && ((k0 + j) & 1) != int(pc.frame_count & 1u);
+            vec3 a = line_light(k0 + j, other, y_lines, pitch_mm, waist, u_r, u_g, u_b);
+            level += a;
+            if (!other) scanline_rgb += a;
+#ifdef KD30_WEB
+            if (KD_FIELD && !other) g_line_peak = max(g_line_peak, line_peak(k0 + j, pitch_mm, waist, u_r, u_g, u_b));
+#endif
+        }
+        M = mask_factor(level, effective_zoom, d_triad, triad_coord, triad_idx, triad_phase,
                         scan_y_for_mask);
-    } else {
+#ifdef KD30_WEB
+        if (KD_FIELD) g_line_peak *= max(M.r, max(M.g, M.b));
+#endif
+    }
+#ifndef KD30_WEB
+    else {
         // Each line as its latest pass left it: lines the beam hasn't reached yet, and when
         // interlaced the other field's, still show the previous picture.
         vec3 a0 = line_light(k0 - 1, line_prev(k0 - 1), y_lines, pitch_mm, waist, u_r, u_g, u_b);
@@ -927,6 +993,7 @@ vec3 evaluate_crt_raster_at(vec2 uv_in, float effective_zoom, bool use_table, ou
         scanline_rgb = line_share(k0 - 1, a0, cap, mp) + line_share(k0, a1, cap, mp) + line_share(k0 + 1, a2, cap, mp);
         if (wide) scanline_rgb += line_share(k0 - 2, b0, cap, mp) + line_share(k0 + 2, b1, cap, mp);
     }
+#endif
     out_sustained_rgb = scanline_rgb;
 
     vec3 beam = scanline_rgb * M;
@@ -940,24 +1007,11 @@ vec3 evaluate_crt_raster_at(vec2 uv_in, float effective_zoom, bool use_table, ou
         out_sustained_rgb *= d_atten;
     }
 
-    if (pc.signal_standard == 0u) {
-        const mat3 sony_ntsc_p22 = mat3(
-            1.05, -0.03, -0.02,
-           -0.02,  1.03, -0.01,
-           -0.01, -0.02,  1.04
-        );
-        beam              = max(vec3(0.0), sony_ntsc_p22 * beam);
-        out_sustained_rgb = max(vec3(0.0), sony_ntsc_p22 * out_sustained_rgb);
-    } else {
-        const mat3 sony_pal_ebu = mat3(
-            1.02, -0.01, -0.01,
-           -0.01,  1.02, -0.01,
-            0.00, -0.01,  1.01
-        );
-        beam              = max(vec3(0.0), sony_pal_ebu * beam);
-        out_sustained_rgb = max(vec3(0.0), sony_pal_ebu * out_sustained_rgb);
+    // Stage 1 leaves the phosphor matrix to stage 2: clamped per field, the fields wouldn't add up.
+    if (!KD_FIELD) {
+        beam              = tube_matrix(beam);
+        out_sustained_rgb = tube_matrix(out_sustained_rgb);
     }
-
     return beam;
 }
 
@@ -1025,15 +1079,90 @@ vec3 sample_raw_nearest(vec2 uv) {
 }
 
 #if defined(KD30_WEB) && defined(KD30_BEAM)
-// MEDIUM and LONG add a slow phosphor component (12 and 24 ms): each refresh keeps e^(-W/tau) of the
-// light the previous one showed and takes the rest from this one, so the light over time is unchanged.
-vec3 persist(vec3 L, ivec2 px) {
+// Phosphor response at w rad/ms per channel (real, imaginary): P22, or a single slow decay of
+// 12 ms (MEDIUM) or 24 ms (LONG).
+void phosphor_response(float w, out vec3 re, out vec3 im) {
     uint p = (pc.osd_mode >> 4) & 3u;
-    float tau = p == 1u ? 12.0 : (p == 2u ? 24.0 : 0.0);
-    float a = (tau > 0.0 && pc.window_ms > 0.0) ? exp(-pc.window_ms / tau) : 0.0;
-    vec3 shown = mix(L, texelFetch(sampler2D(uAccumPrevTex, uSamp), px, 0).rgb, a);
-    imageStore(uAccumOut, px, vec4(shown, 1.0));
-    return shown;
+    if (p == 1u || p == 2u) {
+        float x = w * (p == 1u ? 12.0 : 24.0);
+        re = vec3(1.0 / (1.0 + x * x));
+        im = vec3(-x / (1.0 + x * x));
+        return;
+    }
+    vec3 xf = w * P22_TAU_FAST, xs = w * P22_TAU_SLOW;
+    re = P22_FAST_FRAC / (1.0 + xf * xf) + (1.0 - P22_FAST_FRAC) / (1.0 + xs * xs);
+    im = -(P22_FAST_FRAC * xf / (1.0 + xf * xf) + (1.0 - P22_FAST_FRAC) * xs / (1.0 + xs * xs));
+}
+
+// Light of one pass emitted by t ms after it, spread over two refreshes: the display can't carry
+// flicker at half its refresh rate or above, and a two-refresh box has none. I is the integral of
+// the phosphor's cumulative light (P22, or a single decay for MEDIUM and LONG).
+vec3 s2_integral(float x) {
+    if (x <= 0.0) return vec3(0.0);
+    uint p = (pc.osd_mode >> 4) & 3u;
+    if (p == 1u || p == 2u) {
+        float tau = p == 1u ? 12.0 : 24.0;
+        return vec3(x - tau * (1.0 - exp(-x / tau)));
+    }
+    vec3 f = P22_FAST_FRAC * (x - P22_TAU_FAST * (1.0 - exp(-x / P22_TAU_FAST)));
+    return f + (1.0 - P22_FAST_FRAC) * (x - P22_TAU_SLOW * (1.0 - exp(-x / P22_TAU_SLOW)));
+}
+vec3 s2_emitted(float t, float W2) { return (s2_integral(t) - s2_integral(t - W2)) / W2; }
+
+// Share of a pass's light (1 = its average) this refresh shows, for passes every period, the latest
+// at t0 ms from the refresh's start: from the latest pass (now) and from those before it (before).
+// Where a period is under three refreshes the passes' light overlaps within a refresh; it all goes
+// to the latest picture there, so a refresh never mixes two pictures.
+void stage2_share(float t0, float period, out vec3 now, out vec3 before) {
+    float W = pc.window_ms, W2 = 2.0 * W;
+    uint  p = (pc.osd_mode >> 4) & 3u;
+    float reach = W2 + (p == 2u ? 150.0 : p == 1u ? 75.0 : 25.0);
+    now = (s2_emitted(W - t0, W2) - s2_emitted(-t0, W2)) * (period / W);
+    before = vec3(0.0);
+    for (int j = 1; j < 32; j++) {
+        float tj = t0 - float(j) * period;
+        if (-tj > reach) break;
+        before += s2_emitted(W - tj, W2) - s2_emitted(-tj, W2);
+    }
+    before *= period / W;
+    if (period < 3.0 * W) { now += before; before = vec3(0.0); }
+}
+
+// Stage 2: the light this refresh shows. Each parity's latest pass reached this point at its scan
+// start plus its place in the scan; the other parity's pass was a field earlier. Where a bright line
+// would exceed the display, its flicker is reduced; its average stays the pass's light.
+vec3 stage2_light(ivec2 px, vec2 tube_uv) {
+    bool  il = pc.scan_format != 0u;
+    float F  = pc.field_ms, W = pc.window_ms;
+    float P  = (il ? 2.0 : 1.0) * F;
+    bool  odd = (pc.frame_count & 1u) != 0u;
+    vec4  f0 = texelFetch(sampler2D(uField0Tex, uSamp), px, 0);
+    vec4  f1 = il ? texelFetch(sampler2D(uField1Tex, uSamp), px, 0) : vec4(0.0);
+    vec3  S0 = f0.rgb, S1 = f1.rgb;
+    float pk = 1.0;
+    vec3  w0 = vec3(1.0), w1 = vec3(1.0), b0 = vec3(0.0), b1 = vec3(0.0);
+    if (il && pc.beam_alt >= 0.0) {
+        // One refresh per field: the field the beam just drew shows its pass's light, the other what
+        // is left of its own. The alternation is eased out and back in when it has to change step.
+        vec3 re, im;
+        phosphor_response(3.1415927 / F, re, im);
+        vec3 A = pc.beam_alt * sqrt(re * re + im * im);
+        pk = 1.0 + max(A.r, max(A.g, A.b));
+        w0 = odd ? 1.0 - A : 1.0 + A;
+        w1 = odd ? 1.0 + A : 1.0 - A;
+    } else if (W > 0.0 && F > 0.0) {
+        float t0 = pc.cur_start_ms + clamp(tube_uv.y, 0.0, 1.0) * F * 0.92;
+        stage2_share(t0 - (il && odd ? F : 0.0), P, w0, b0);
+        if (il) stage2_share(t0 - (odd ? 0.0 : F), P, w1, b1);
+        pk = max(1.0, P / (2.0 * W));
+    }
+    // Lines the beam hasn't reached yet still show the picture before.
+    vec3  B0 = texelFetch(sampler2D(uField0PrevTex, uSamp), px, 0).rgb;
+    vec3  B1 = il ? texelFetch(sampler2D(uField1PrevTex, uSamp), px, 0).rgb : vec3(0.0);
+    float m  = max(f0.a, f1.a);
+    float d  = pk > 1.001 ? clamp((0.8 * display_cap() / max(m, 1e-4) - 1.0) / (pk - 1.0), 0.0, 1.0) : 0.0;
+    vec3  timed  = S0 * w0 + B0 * b0 + S1 * w1 + B1 * b1;
+    return tube_matrix(mix(S0 + S1, timed, d));
 }
 #endif
 
@@ -1042,17 +1171,25 @@ void main() {
     vec2 win_uv = (vec2(px) + 0.5) / vec2(pc.output_size);
     bool in_bezel = false;
     vec2 tube_uv = map_window_to_crt_uv(win_uv, in_bezel);
+#ifndef KD30_WEB
     if (KD_BEAM && pc.window_ms > 0.0 && pc.field_ms > 0.0) fill_line_table(tube_uv);
+#endif
     if (px.x >= int(pc.output_size.x) || px.y >= int(pc.output_size.y)) return;
+#ifdef KD30_FIELD
+    vec3 field_sustained = vec3(0.0);
+    vec3 field_light = in_bezel ? vec3(0.0) : evaluate_crt_raster_at(tube_uv, 1.0, false, field_sustained);
+    imageStore(uOutputFrame, px, vec4(field_light, in_bezel ? 0.0 : g_line_peak));
+#else
 
     vec3 final_srgb = vec3(0.0);
     float field_tag = float(pc.frame_count & 255u);
 
     if (!in_bezel) {
         vec3 sustained_rgb = vec3(0.0);
-        vec3 crt_linear = evaluate_crt_raster_at(tube_uv, 1.0, true, sustained_rgb);
 #if defined(KD30_WEB) && defined(KD30_BEAM)
-        crt_linear = persist(crt_linear, px);
+        vec3 crt_linear = stage2_light(px, tube_uv);
+#else
+        vec3 crt_linear = evaluate_crt_raster_at(tube_uv, 1.0, true, sustained_rgb);
 #endif
         final_srgb = encode_crt(compensate_panel(crt_linear, px));
 
@@ -1113,4 +1250,5 @@ void main() {
 
     evaluate_sony_wega_osd(win_uv, final_srgb);
     imageStore(uOutputFrame, px, to_swapchain(final_srgb));
+#endif
 }
