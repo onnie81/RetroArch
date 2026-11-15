@@ -87,6 +87,8 @@ layout(push_constant) uniform ScanoutPush {
     float mask_strength;    // aperture grille contrast at 1x; 0 = per-layout default
 #ifdef KD30_WEB
     float beam_alt;         // stage 2 with a pass every two refreshes: alternation depth 0..1, else -1
+    float ready_rows;       // stage 1: first row to draw; stage 2: rows from here on of parity ready_par
+    float ready_par;        //   still hold the field before (stage 1 draws a field over two refreshes)
 #endif
 } pc;
 
@@ -1128,6 +1130,28 @@ void stage2_share(float t0, float period, out vec3 now, out vec3 before) {
     if (period < 3.0 * W) { now += before; before = vec3(0.0); }
 }
 
+// The timing shares depend only on the row, so each workgroup row works them out once: each parity's
+// latest pass reached this row at its scan start plus its place in the scan; the other parity's pass
+// was a field earlier.
+shared vec3 s2_row[16][4];
+void fill_stage2_row(vec2 tube_uv) {
+    if (gl_LocalInvocationID.x == 0u) {
+        bool  il = pc.scan_format != 0u;
+        float F  = pc.field_ms, W = pc.window_ms;
+        float P  = (il ? 2.0 : 1.0) * F;
+        bool  odd = (pc.frame_count & 1u) != 0u;
+        vec3  w0 = vec3(1.0), w1 = vec3(1.0), b0 = vec3(0.0), b1 = vec3(0.0);
+        if (!(il && pc.beam_alt >= 0.0) && W > 0.0 && F > 0.0) {
+            float t0 = pc.cur_start_ms + clamp(tube_uv.y, 0.0, 1.0) * F * 0.92;
+            stage2_share(t0 - (il && odd ? F : 0.0), P, w0, b0);
+            if (il) stage2_share(t0 - (odd ? 0.0 : F), P, w1, b1);
+        }
+        uint r = gl_LocalInvocationID.y;
+        s2_row[r][0] = w0; s2_row[r][1] = b0; s2_row[r][2] = w1; s2_row[r][3] = b1;
+    }
+    barrier();
+}
+
 // Stage 2: the light this refresh shows. Each parity's latest pass reached this point at its scan
 // start plus its place in the scan; the other parity's pass was a field earlier. Where a bright line
 // would exceed the display, its flicker is reduced; its average stays the pass's light.
@@ -1138,6 +1162,11 @@ vec3 stage2_light(ivec2 px, vec2 tube_uv) {
     bool  odd = (pc.frame_count & 1u) != 0u;
     vec4  f0 = texelFetch(sampler2D(uField0Tex, uSamp), px, 0);
     vec4  f1 = il ? texelFetch(sampler2D(uField1Tex, uSamp), px, 0) : vec4(0.0);
+    vec4  p0 = texelFetch(sampler2D(uField0PrevTex, uSamp), px, 0);
+    vec4  p1 = il ? texelFetch(sampler2D(uField1PrevTex, uSamp), px, 0) : vec4(0.0);
+    if (float(px.y) >= pc.ready_rows) {
+        if (pc.ready_par < 0.5) f0 = p0; else f1 = p1;
+    }
     vec3  S0 = f0.rgb, S1 = f1.rgb;
     float pk = 1.0;
     vec3  w0 = vec3(1.0), w1 = vec3(1.0), b0 = vec3(0.0), b1 = vec3(0.0);
@@ -1151,14 +1180,12 @@ vec3 stage2_light(ivec2 px, vec2 tube_uv) {
         w0 = odd ? 1.0 - A : 1.0 + A;
         w1 = odd ? 1.0 + A : 1.0 - A;
     } else if (W > 0.0 && F > 0.0) {
-        float t0 = pc.cur_start_ms + clamp(tube_uv.y, 0.0, 1.0) * F * 0.92;
-        stage2_share(t0 - (il && odd ? F : 0.0), P, w0, b0);
-        if (il) stage2_share(t0 - (odd ? 0.0 : F), P, w1, b1);
+        uint r = gl_LocalInvocationID.y;
+        w0 = s2_row[r][0]; b0 = s2_row[r][1]; w1 = s2_row[r][2]; b1 = s2_row[r][3];
         pk = max(1.0, P / (2.0 * W));
     }
     // Lines the beam hasn't reached yet still show the picture before.
-    vec3  B0 = texelFetch(sampler2D(uField0PrevTex, uSamp), px, 0).rgb;
-    vec3  B1 = il ? texelFetch(sampler2D(uField1PrevTex, uSamp), px, 0).rgb : vec3(0.0);
+    vec3  B0 = p0.rgb, B1 = p1.rgb;
     float m  = max(f0.a, f1.a);
     float d  = pk > 1.001 ? clamp((0.8 * display_cap() / max(m, 1e-4) - 1.0) / (pk - 1.0), 0.0, 1.0) : 0.0;
     vec3  timed  = S0 * w0 + B0 * b0 + S1 * w1 + B1 * b1;
@@ -1168,11 +1195,16 @@ vec3 stage2_light(ivec2 px, vec2 tube_uv) {
 
 void main() {
     ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+#ifdef KD30_FIELD
+    px.y += int(pc.ready_rows);
+#endif
     vec2 win_uv = (vec2(px) + 0.5) / vec2(pc.output_size);
     bool in_bezel = false;
     vec2 tube_uv = map_window_to_crt_uv(win_uv, in_bezel);
 #ifndef KD30_WEB
     if (KD_BEAM && pc.window_ms > 0.0 && pc.field_ms > 0.0) fill_line_table(tube_uv);
+#elif defined(KD30_BEAM)
+    fill_stage2_row(tube_uv);
 #endif
     if (px.x >= int(pc.output_size.x) || px.y >= int(pc.output_size.y)) return;
 #ifdef KD30_FIELD
