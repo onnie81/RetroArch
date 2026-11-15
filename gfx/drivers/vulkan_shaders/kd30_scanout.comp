@@ -93,7 +93,7 @@ layout(push_constant) uniform ScanoutPush {
     float flicker_scale;    // stage 2: flicker depth the display's missed refreshes leave room for
     float direct_turn;      // -1: write the output frame; 0..3: write the HDR canvas turned that many quarters
     uint  emu_hud0;         // HUD emulator rows: ms per frame x100 (bits 0-15), core frames/s x10 (16-31)
-    uint  emu_hud1;         //   game pictures/s x10 (bits 0-15), audio % of real time (16-31)
+    uint  emu_hud1;         //   game frames/s x10 (bits 0-15; 0xFFFF unknown), audio % of real time (16-31)
 #endif
 } pc;
 
@@ -425,7 +425,7 @@ int perf_char_at(int row, int col) {
     } else if (row == 4) {
         const int g1[5] = {71, 65, 77, 69, 58}; // "GAME:"
         if (col >= 0 && col < 5) return g1[col];
-        if (col >= 5 && col <= 9) return format_fps_char(float(pc.emu_hud1 & 0xFFFFu) / 10.0, col - 5);
+        if (col >= 5 && col <= 9) return (pc.emu_hud1 & 0xFFFFu) == 0xFFFFu ? (col >= 8 ? 45 : 32) : format_fps_char(float(pc.emu_hud1 & 0xFFFFu) / 10.0, col - 5);
         const int a0[4] = {65, 85, 68, 58}; // "AUD:"
         if (col >= 12 && col < 16) return a0[col - 12];
         if (col >= 16 && col <= 19) return format_uint4_char(pc.emu_hud1 >> 16u, col - 16);
@@ -661,12 +661,31 @@ float display_cap() {
     return max(pc.display_peak_nits / GRAPHICS_WHITE_NITS, 1.0) * GRAPHICS_WHITE_NITS / max(pc.crt_white_nits, 1.0);
 }
 
-// Aperture mask as a factor on the beam's light; stripes and dots widen with the beam level.
+// How far the mask is drawn as the tube's own: 0 at 1x (its contrast as the eye sees it at a
+// distance), 1 from the magnifier's 4x.
+float macro_of(float effective_zoom) { return clamp((effective_zoom - 1.0) / 3.0, 0.0, 1.0); }
+
+// Dot-trio phosphor dots: discs DOT_RADIUS dot spacings wide on the black matrix, in rows 0.866 of a
+// spacing apart, each row half a triad along from the last. The dots of one colour cover DOT_FILL
+// of the glass.
+const float DOT_RADIUS = 0.45;
+const float DOT_FILL   = 3.14159265 * DOT_RADIUS * DOT_RADIUS / 2.5980762;
+
+// How much of each colour's dot covers the point, in the dot row with this stagger, y_rows from
+// the row's middle (in rows); aa is half an output pixel in dot spacings.
+vec3 dot_discs(float triad_coord, float stagger, float y_rows, float aa) {
+    vec3 dx = abs(fract(vec3(triad_coord + stagger) - vec3(0.1666667, 0.5000000, 0.8333333) + 0.5) - 0.5) * 3.0;
+    vec3 dist = sqrt(dx * dx + vec3(y_rows * y_rows * 0.75));
+    return smoothstep(vec3(DOT_RADIUS + aa), vec3(DOT_RADIUS - aa), dist);
+}
+
+// Aperture mask as a factor on the beam's light; stripes widen with the beam level. locked: the
+// mask is drawn in whole pixels (see the caller).
 vec3 mask_factor(vec3 level, float effective_zoom, float d_triad, float triad_coord,
-                 float triad_idx, float triad_phase, float scan_y_for_mask) {
+                 float triad_idx, float triad_phase, float scan_y_for_mask, bool locked) {
     // Evaluate Selected Phosphor Grille / Mask Layout (0..4) with Horizontal Lumina Expansion.
     // d_triad: triads per output pixel.
-    float macro_blend = clamp((effective_zoom - 1.5) / 4.0, 0.0, 1.0);
+    float macro_blend = macro_of(effective_zoom);
 
     if (pc.mask_layout <= 2u || pc.mask_layout == 5u) {
         // Horizontal Lumina Expansion: strongly excited phosphor stripes expand their effective
@@ -733,24 +752,32 @@ vec3 mask_factor(vec3 level, float effective_zoom, float d_triad, float triad_co
     } else {
         float dot_rows    = scan_y_for_mask / 0.8660254;
         float row_stagger = mod(floor(dot_rows), 2.0) * 0.5;
-        float dot_triad_x = fract(triad_coord + row_stagger);
-        float dot_y       = fract(dot_rows) - 0.5;
-
-        vec3 dx = abs(vec3(dot_triad_x) - vec3(0.1666667, 0.5000000, 0.8333333)) * 3.0;
-        vec3 r2 = dx * dx + vec3(dot_y * dot_y * 6.75);
-        vec3 dots = exp(-pow(r2 / (0.40 + 0.18 * clamp(level, vec3(0.0), vec3(1.0))), vec3(1.8)));
-
-        float dot_vis = smoothstep(0.90, 0.20, d_triad) * (0.35 + 0.58 * macro_blend);
-        vec3 dot_mask = mix(vec3(1.0), dots * 1.65, dot_vis);
-        return dot_mask;
+        float fy = fract(dot_rows) - 0.5;
+        if (!locked) {
+            // A phosphor dot gives off its own colour only: nothing of the other two beams shows on
+            // it, and nothing between the dots. A pixel takes what it covers of the dots of this row
+            // and the next (aa: half a pixel in dot spacings; a soft edge that wide adds 0.2 aa^2 to
+            // the disc's area).
+            float aa  = clamp(1.5 * d_triad, 0.03, 0.40);
+            vec3 lit  = dot_discs(triad_coord, row_stagger, fy, aa)
+                      + dot_discs(triad_coord, 0.5 - row_stagger, fy < 0.0 ? fy + 1.0 : fy - 1.0, aa);
+            lit *= DOT_RADIUS * DOT_RADIUS / (DOT_RADIUS * DOT_RADIUS + 0.2 * aa * aa);
+            return mix(vec3(1.0), lit / DOT_FILL, smoothstep(0.90, 0.20, d_triad) * mix(0.35, 1.0, macro_blend));
+        }
+        // In whole pixels a dot is under two pixels: the lattice's first harmonics, which average to
+        // 1 for each colour over a triad and a pair of rows of whole pixels (no tint, no dimming).
+        vec3  px = 6.28318530 * (vec3(triad_coord + row_stagger) - vec3(0.1666667, 0.5000000, 0.8333333));
+        float py = 3.14159265 * fy;
+        float locked_vis = smoothstep(0.90, 0.20, d_triad) * 0.35;
+        return vec3(1.0) + locked_vis * (2.0 * cos(px) * cos(py) + vec3(cos(2.0 * py))) / 3.0;
     }
 }
 
 #ifdef KD30_WEB
 // The most the mask passes anywhere in a triad (at its stripe or dot centres, for the narrowest
 // stripes), so the flicker limit set from it is the same across a triad.
-float mask_peak(float effective_zoom, float d_triad) {
-    float macro_blend = clamp((effective_zoom - 1.5) / 4.0, 0.0, 1.0);
+float mask_peak(float effective_zoom, float d_triad, bool locked) {
+    float macro_blend = macro_of(effective_zoom);
     if (pc.mask_layout <= 2u || pc.mask_layout == 5u) {
         float px1, px2, px3;
         if (pc.subpixel_layout > 0.5) {
@@ -778,8 +805,8 @@ float mask_peak(float effective_zoom, float d_triad) {
         float px1 = (sin(a1) / max(a1, 1e-4)) * smoothstep(0.90, 0.20, d_triad);
         return max(1.0, 0.88 + (0.30 + 0.55 * macro_blend) * abs(px1));
     }
-    float dot_vis = smoothstep(0.90, 0.20, d_triad) * (0.35 + 0.58 * macro_blend);
-    return mix(1.0, 1.65, dot_vis);
+    if (!locked) return mix(1.0, 1.0 / DOT_FILL, smoothstep(0.90, 0.20, d_triad) * mix(0.35, 1.0, macro_blend));
+    return 1.0 + smoothstep(0.90, 0.20, d_triad) * 0.35;
 }
 #endif
 
@@ -982,21 +1009,24 @@ vec3 evaluate_crt_raster_at(vec2 uv_in, float effective_zoom, bool use_table, ou
     float triad_idx    = floor(triad_coord);
     float triad_phase  = triad_coord - triad_idx;
 
+    // Mask rows (slot and dot masks), whole pixels tall on the same terms. The dot mask's rows are
+    // 0.866 of a dot spacing (a third of the triad) apart; drawn in whole pixels, 0.866 of a triad.
+    bool  dot_mask = pc.mask_layout == 4u;
+    float row_unit = eff_pitch_mm * (dot_mask ? (px_locked ? 0.8660254 : 0.2886751) : 1.0);
+    float row_px   = tube_px.y * row_unit / TUBE_H_MM;
+    float rows     = px_locked ? tube_px.y / max(2.0, round(row_px)) : TUBE_H_MM / row_unit;
+    float scan_y_for_mask = uv_in.y * rows * (dot_mask ? 0.8660254 : 1.0);
+
     // The beam is sampled at the nearest red (1/6), green (3/6) and blue (5/6) stripes, carried from the
-    // glass to the raster.
-    float near_r_idx = floor(triad_coord - 0.1666667 + 0.5) + 0.1666667;
-    float near_g_idx = floor(triad_coord - 0.5000000 + 0.5) + 0.5000000;
-    float near_b_idx = floor(triad_coord - 0.8333333 + 0.5) + 0.8333333;
+    // glass to the raster, so a stripe or dot is lit evenly across. Dot rows sit half a triad along
+    // from one to the next.
+    float stagger    = dot_mask ? mod(floor(uv_in.y * rows), 2.0) * 0.5 : 0.0;
+    float near_r_idx = floor(triad_coord + stagger - 0.1666667 + 0.5) + 0.1666667 - stagger;
+    float near_g_idx = floor(triad_coord + stagger - 0.5000000 + 0.5) + 0.5000000 - stagger;
+    float near_b_idx = floor(triad_coord + stagger - 0.8333333 + 0.5) + 0.8333333 - stagger;
     float u_r = clamp((near_r_idx / total_triads - 0.5) * b_scale + 0.5, 0.0, 1.0);
     float u_g = clamp((near_g_idx / total_triads - 0.5) * b_scale + 0.5, 0.0, 1.0);
     float u_b = clamp((near_b_idx / total_triads - 0.5) * b_scale + 0.5, 0.0, 1.0);
-
-    // Mask rows (slot and dot masks), whole pixels tall on the same terms; the dot mask's rows are
-    // 0.866 of a pitch apart.
-    float row_unit = eff_pitch_mm * (pc.mask_layout == 4u ? 0.8660254 : 1.0);
-    float row_px   = tube_px.y * row_unit / TUBE_H_MM;
-    float rows     = px_locked ? tube_px.y / max(2.0, round(row_px)) : TUBE_H_MM / row_unit;
-    float scan_y_for_mask = uv_in.y * rows * (pc.mask_layout == 4u ? 0.8660254 : 1.0);
 
     // Raster: one beam trace per source line (progressive: all lines each field; interlaced: the
     // source frame is the weave of the last two fields, so each line sits at its frame position).
@@ -1035,9 +1065,9 @@ vec3 evaluate_crt_raster_at(vec2 uv_in, float effective_zoom, bool use_table, ou
 #endif
         }
         M = mask_factor(level, effective_zoom, d_triad, triad_coord, triad_idx, triad_phase,
-                        scan_y_for_mask);
+                        scan_y_for_mask, px_locked);
 #ifdef KD30_WEB
-        if (KD_FIELD) g_line_peak *= mask_peak(effective_zoom, d_triad);
+        if (KD_FIELD) g_line_peak *= mask_peak(effective_zoom, d_triad, px_locked);
 #endif
     }
 #ifndef KD30_WEB
@@ -1053,7 +1083,7 @@ vec3 evaluate_crt_raster_at(vec2 uv_in, float effective_zoom, bool use_table, ou
             b1 = line_light(k0 + 2, line_prev(k0 + 2), y_lines, pitch_mm, waist, u_r, u_g, u_b);
         }
         M = mask_factor(a0 + a1 + a2 + b0 + b1, effective_zoom, d_triad, triad_coord, triad_idx, triad_phase,
-                        scan_y_for_mask);
+                        scan_y_for_mask, px_locked);
         // Most a refresh can show here before the mask: the output's knee over the colour matrix
         // and the mask's gain.
         vec3  cap = 0.76 * display_cap() / max(M, vec3(0.05));
