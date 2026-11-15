@@ -91,6 +91,7 @@ layout(push_constant) uniform ScanoutPush {
     float ready_par;        //   still hold the field before (stage 1 draws a field over two refreshes)
     float miss_comp;        // stage 2: the refresh before was missed (its window shown twice)
     float flicker_scale;    // stage 2: flicker depth the display's missed refreshes leave room for
+    float direct_turn;      // -1: write the output frame; 0..3: write the HDR canvas turned that many quarters
 #endif
 } pc;
 
@@ -1179,9 +1180,16 @@ vec3 stage2_light(ivec2 px, vec2 tube_uv) {
     bool  odd = (pc.frame_count & 1u) != 0u;
     vec4  f0 = texelFetch(sampler2D(uField0Tex, uSamp), px, 0);
     vec4  f1 = il ? texelFetch(sampler2D(uField1Tex, uSamp), px, 0) : vec4(0.0);
-    vec4  p0 = texelFetch(sampler2D(uField0PrevTex, uSamp), px, 0);
-    vec4  p1 = il ? texelFetch(sampler2D(uField1PrevTex, uSamp), px, 0) : vec4(0.0);
-    if (float(px.y) >= pc.ready_rows) {
+    // The picture before is only read where it still shows: rows the beam hasn't reached, and rows
+    // stage 1 hasn't drawn yet.
+    uint  r  = gl_LocalInvocationID.y;
+    bool  nr = float(px.y) >= pc.ready_rows;
+    vec4  p0 = vec4(0.0), p1 = vec4(0.0);
+    if ((nr && pc.ready_par < 0.5) || any(greaterThan(s2_row[r][1], vec3(0.0))))
+        p0 = texelFetch(sampler2D(uField0PrevTex, uSamp), px, 0);
+    if (il && ((nr && pc.ready_par >= 0.5) || any(greaterThan(s2_row[r][3], vec3(0.0)))))
+        p1 = texelFetch(sampler2D(uField1PrevTex, uSamp), px, 0);
+    if (nr) {
         if (pc.ready_par < 0.5) f0 = p0; else f1 = p1;
     }
     vec3  S0 = f0.rgb, S1 = f1.rgb;
@@ -1197,7 +1205,6 @@ vec3 stage2_light(ivec2 px, vec2 tube_uv) {
         w0 = odd ? 1.0 - A : 1.0 + A;
         w1 = odd ? 1.0 + A : 1.0 - A;
     } else if (W > 0.0 && F > 0.0) {
-        uint r = gl_LocalInvocationID.y;
         w0 = s2_row[r][0]; b0 = s2_row[r][1]; w1 = s2_row[r][2]; b1 = s2_row[r][3];
         pk = max(1.0, P / (2.0 * W));
     }
@@ -1299,6 +1306,19 @@ void main() {
     }
 
     evaluate_sony_wega_osd(win_uv, final_srgb);
+#ifdef KD30_WEB
+    // On an HDR canvas the frame goes straight to the screen, turned and sRGB-encoded as the blit would.
+    vec4 o = to_swapchain(final_srgb);
+    if (pc.direct_turn >= 0.0) {
+        int t = int(pc.direct_turn + 0.5);
+        ivec2 sz = ivec2(pc.output_size);
+        px = t == 1 ? ivec2(px.y, sz.x - 1 - px.x) : t == 2 ? sz - ivec2(1) - px : t == 3 ? ivec2(sz.y - 1 - px.y, px.x) : px;
+        vec3 a = abs(o.rgb);
+        o.rgb = sign(o.rgb) * mix(1.055 * pow(a, vec3(1.0 / 2.4)) - 0.055, a * 12.92, lessThanEqual(a, vec3(0.0031308)));
+    }
+    imageStore(uOutputFrame, px, o);
+#else
     imageStore(uOutputFrame, px, to_swapchain(final_srgb));
+#endif
 #endif
 }
