@@ -679,6 +679,24 @@ vec3 dot_discs(float triad_coord, float stagger, float y_rows, float aa) {
     return smoothstep(vec3(DOT_RADIUS + aa), vec3(DOT_RADIUS - aa), dist);
 }
 
+// Under the magnifier a phosphor stripe is its own colour between black guard bands, STRIPE_W of
+// a triad wide: how far each colour's stripe is, and the part of a pixel (dx - aa to dx + aa)
+// inside a stripe half_w to each side.
+const float STRIPE_W = 0.24;
+vec3 stripe_offset(vec3 tphase) {
+    return abs(fract(tphase - vec3(0.1666667, 0.5000000, 0.8333333) + 0.5) - 0.5);
+}
+vec3 stripe_cover(vec3 dx, vec3 half_w, float aa) {
+    return clamp((min(dx + aa, half_w) - max(dx - aa, -half_w)) / (2.0 * aa), vec3(0.0), vec3(1.0));
+}
+
+// Slot mask: each stripe is cut into slots two triad pitches apart with rounded ends, SLOT_GAP of
+// black between them, a triad's slots half a pitch up from its neighbours'.
+const float SLOT_GAP = 0.24;
+float slot_area(float width) {
+    return width * (2.0 - SLOT_GAP - width) + 0.7853982 * width * width;
+}
+
 // Aperture mask as a factor on the beam's light; stripes widen with the beam level. locked: the
 // mask is drawn in whole pixels (see the caller).
 vec3 mask_factor(vec3 level, float effective_zoom, float d_triad, float triad_coord,
@@ -720,11 +738,10 @@ vec3 mask_factor(vec3 level, float effective_zoom, float d_triad, float triad_co
         vec3 st_sinc2 = (sin(6.28318530 * duty) / (6.28318530 * duty)) * 0.6366;
         vec3 st_sinc3 = (sin(9.42477796 * duty) / (9.42477796 * duty)) * 0.3001;
 
-        // Unified analytical box-filtered Fourier series of the [R | Dag | G | Dag | B | Dag] stripes:
-        vec3 grille_full = max(vec3(0.0), vec3(1.0)
-                         + 2.0 * st_sinc1 * px_sinc1 * cos(phases1)
-                         + 2.0 * st_sinc2 * px_sinc2 * cos(phases2)
-                         + 2.0 * st_sinc3 * px_sinc3 * cos(phases3));
+        // Unified analytical box-filtered Fourier series of the [R | Dag | G | Dag | B | Dag] stripes,
+        // as its swing about 1 (h1..h3: the three harmonics' sizes).
+        vec3 h1 = 2.0 * st_sinc1 * px_sinc1, h2 = 2.0 * st_sinc2 * px_sinc2, h3 = 2.0 * st_sinc3 * px_sinc3;
+        vec3 grille_swing = h1 * cos(phases1) + h2 * cos(phases2) + h3 * cos(phases3);
 
         // Intra-triad phosphor crystal scatter (high-energy excitation in one stripe scatters light into the triad)
         float triad_luma = dot(level, vec3(0.299, 0.587, 0.114));
@@ -733,9 +750,23 @@ vec3 mask_factor(vec3 level, float effective_zoom, float d_triad, float triad_co
         float grille_strength_1x = pc.mask_strength > 0.0 ? pc.mask_strength
                                  : ((pc.mask_layout == 1u) ? 0.38 : ((pc.mask_layout == 2u || pc.mask_layout == 5u) ? 0.18 : 0.28));
         float blend_to_full = mix(grille_strength_1x, 1.0, macro_blend);
-        vec3 eff_grille = mix(vec3(1.0), grille_full, blend_to_full);
+        // Where the pixels are too coarse for the upper harmonics the series would dip below zero
+        // between the stripes. Clipped there it averaged above 1, by a different amount for each
+        // colour: white came out brighter and tinted. Its lowest point (looked for every 15 degrees
+        // from a quarter to half a triad away from the stripe) is scaled to touch zero instead, so
+        // every colour averages 1.
+        vec3 low = min(min(min(-h2, -0.2588 * h1 - 0.8660 * h2 + 0.7071 * h3),
+                           min(-0.5 * h1 - 0.5 * h2 + h3, -0.7071 * h1 + 0.7071 * h3)),
+                       min(min(-0.8660 * h1 + 0.5 * h2, -0.9659 * h1 + 0.8660 * h2 - 0.7071 * h3),
+                           -h1 + h2 - h3));
+        vec3 eff_grille = max(vec3(0.0), vec3(1.0) + grille_swing * blend_to_full / max(-low * blend_to_full, vec3(1.0)));
+        vec3 glow = (0.16 + 0.24 * clamp(level + vec3(triad_luma * 0.35), vec3(0.0), vec3(1.0))) * (0.25 * blend_to_full);
+        vec3 eye = eff_grille * (1.0 - glow) + glow;
+        if (locked || macro_blend <= 0.0) return eye;
 
-        return eff_grille + (0.16 + 0.24 * clamp(level + vec3(triad_luma * 0.35), vec3(0.0), vec3(1.0))) * (0.25 * blend_to_full);
+        float aa    = max(0.5 * d_triad, 1e-4);
+        vec3  lit   = stripe_cover(stripe_offset(tphase), vec3(0.5 * STRIPE_W), aa) / STRIPE_W;
+        return mix(eye, mix(vec3(1.0), lit, smoothstep(0.90, 0.20, d_triad)), macro_blend);
     } else if (pc.mask_layout == 3u) {
         vec3 phases1 = 6.28318530 * (triad_phase - vec3(0.1666667, 0.5000000, 0.8333333));
         float p_arg1 = 3.14159265 * min(d_triad, 1.0);
@@ -745,10 +776,27 @@ vec3 mask_factor(vec3 level, float effective_zoom, float d_triad, float triad_co
         float slot_v = fract(scan_y_for_mask * 0.5 + col_parity * 0.5);
         float bridge = 1.0 - (0.32 + 0.38 * macro_blend) * exp(-pow((slot_v - 0.5) / 0.14, 4.0));
 
-        vec3 slot_rgb = vec3(0.88) + (0.30 + 0.55 * macro_blend) * px_sinc1 * cos(phases1);
-        slot_rgb = max(vec3(0.08), slot_rgb) * bridge;
-        vec3 mask_f = mix(slot_rgb, vec3(1.0), clamp(level * 0.38, 0.0, 0.55));
-        return mask_f;
+        // The bridge takes 0.2538 of its depth off the average; the pattern is scaled back to 1.
+        vec3 slot_rgb = vec3(1.0) + (0.34 + 0.62 * macro_blend) * px_sinc1 * cos(phases1);
+        slot_rgb = max(vec3(0.09), slot_rgb) * bridge / (1.0 - 0.2538 * (0.32 + 0.38 * macro_blend));
+        vec3 eye = mix(slot_rgb, vec3(1.0), clamp(level * 0.38, 0.0, 0.55));
+        if (locked || macro_blend <= 0.0) return eye;
+
+        // A pixel takes what it covers of each slot: across, the slot's width at that height; down,
+        // two heights within the pixel (aa: half a pixel in triads, which are the rows here).
+        float hw    = 0.5 * STRIPE_W;
+        float aa    = max(0.5 * d_triad, 1e-4);
+        vec3  dx    = stripe_offset(vec3(triad_coord));
+        vec3  up    = mod(floor(vec3(triad_coord) - vec3(0.1666667, 0.5000000, 0.8333333) + 0.5), 2.0) * 0.5;
+        vec3  lit   = vec3(0.0);
+        for (int k = 0; k < 2; k++) {
+            float y     = scan_y_for_mask + (k == 0 ? -0.5773503 : 0.5773503) * aa;
+            vec3  along = 1.0 - 2.0 * abs(fract(vec3(y * 0.5) + up) - 0.5);
+            vec3  past  = max(along - (1.0 - 0.5 * SLOT_GAP - hw), vec3(0.0));
+            lit += stripe_cover(dx, sqrt(max(vec3(hw * hw) - past * past, vec3(0.0))), aa);
+        }
+        lit /= slot_area(STRIPE_W);
+        return mix(eye, mix(vec3(1.0), lit, smoothstep(0.90, 0.20, d_triad)), macro_blend);
     } else {
         float dot_rows    = scan_y_for_mask / 0.8660254;
         float row_stagger = mod(floor(dot_rows), 2.0) * 0.5;
@@ -798,12 +846,16 @@ float mask_peak(float effective_zoom, float d_triad, bool locked) {
         float strength = pc.mask_strength > 0.0 ? pc.mask_strength
                        : ((pc.mask_layout == 1u) ? 0.38 : ((pc.mask_layout == 2u || pc.mask_layout == 5u) ? 0.18 : 0.28));
         float blend = mix(strength, 1.0, macro_blend);
-        return mix(1.0, g, blend) + 0.1 * blend;
+        float eye = mix(1.0, g, blend) + 0.1 * blend;
+        if (locked || macro_blend <= 0.0) return eye;
+        return mix(eye, mix(1.0, 1.0 / STRIPE_W, smoothstep(0.90, 0.20, d_triad)), macro_blend);
     }
     if (pc.mask_layout == 3u) {
         float a1 = 3.14159265 * min(d_triad, 1.0);
         float px1 = (sin(a1) / max(a1, 1e-4)) * smoothstep(0.90, 0.20, d_triad);
-        return max(1.0, 0.88 + (0.30 + 0.55 * macro_blend) * abs(px1));
+        float eye = (1.0 + (0.34 + 0.62 * macro_blend) * abs(px1)) / (1.0 - 0.2538 * (0.32 + 0.38 * macro_blend));
+        if (locked || macro_blend <= 0.0) return eye;
+        return mix(eye, mix(1.0, 2.0 / slot_area(STRIPE_W), smoothstep(0.90, 0.20, d_triad)), macro_blend);
     }
     if (!locked) return mix(1.0, 1.0 / DOT_FILL, smoothstep(0.90, 0.20, d_triad) * mix(0.35, 1.0, macro_blend));
     return 1.0 + smoothstep(0.90, 0.20, d_triad) * 0.35;
