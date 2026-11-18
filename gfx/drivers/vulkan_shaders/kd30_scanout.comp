@@ -97,6 +97,19 @@ layout(push_constant) uniform ScanoutPush {
 #endif
 } pc;
 
+// mask_layout: the layout in bits 0-7, the web player's MASK PITCH in bits 8-15 (percent, 0 = 100).
+#define MASK_LAYOUT (pc.mask_layout & 255u)
+float mask_pitch_scale() {
+    uint p = (pc.mask_layout >> 8) & 255u;
+    return p == 0u ? 1.0 : float(p) / 100.0;
+}
+// A triad's width in screen pixels where it is drawn a whole number wide (for the OSD), else 0.
+float g_triad_px = 0.0;
+vec2  tube_size_px();
+float mask_pitch_mm();
+float mask_raster_mm();
+float mask_locked_px(float px_triad, float zoom);
+
 uvec2 pack8x8(uint r0, uint r1, uint r2, uint r3, uint r4, uint r5, uint r6, uint r7) {
     return uvec2((r0 << 24u) | (r1 << 16u) | (r2 << 8u) | r3,
                  (r4 << 24u) | (r5 << 16u) | (r6 << 8u) | r7);
@@ -287,9 +300,16 @@ int banner_char_at(int row, int col) {
     return 32;
 }
 
-// The web player adds a STREAM row (osd_mode bits 25-26: 1 lossless, 2 H.264; bit 27 when it is fixed).
+// The web player adds a STREAM row (osd_mode bits 25-26: 1 lossless, 2 H.264; bit 27 when it is fixed)
+// and a MASK PITCH row under MASK LAYOUT (bit 28).
+bool menu_pitch_row() { return ((pc.osd_mode >> 28) & 1u) != 0u; }
 int menu_items() {
-    return ((pc.osd_mode >> 25) & 3u) != 0u ? 12 : 11;
+    return 11 + (((pc.osd_mode >> 25) & 3u) != 0u ? 1 : 0) + (menu_pitch_row() ? 1 : 0);
+}
+// The item on a row: MASK PITCH is item 12 and takes the sixth row.
+int menu_item(int vis) {
+    if (!menu_pitch_row() || vis < 5) return vis;
+    return vis == 5 ? 12 : vis - 1;
 }
 
 int menu_char_at(int row, int col) {
@@ -306,10 +326,11 @@ int menu_char_at(int row, int col) {
         return (c >= 0 && c < 26) ? ftr[c] : 32;
     }
 
-    int item = row - 1;
-    if (item < 0 || item >= menu_items()) return 32;
+    int vis = row - 1;
+    if (vis < 0 || vis >= menu_items()) return 32;
+    int item = menu_item(vis);
 
-    if (c == 0) return (uint(item) == pc.osd_selected_row) ? 62 : 32;
+    if (c == 0) return (uint(vis) == pc.osd_selected_row) ? 62 : 32;
     if (c == 1) return 32;
 
     if (c >= 2 && c <= 13) {
@@ -326,6 +347,7 @@ int menu_char_at(int row, int col) {
         if (item == 9) { const int L[12] = {68,73,83,80,76,65,89,32,80,69,65,75}; return L[lc]; } // "DISPLAY PEAK"
         if (item == 10) { const int L[12] = {80,69,82,83,73,83,84,69,78,67,69,32}; return L[lc]; } // "PERSISTENCE "
         if (item == 11) { const int L[12] = {83,84,82,69,65,77,32,32,32,32,32,32}; return L[lc]; } // "STREAM      "
+        if (item == 12) { const int L[12] = {77,65,83,75,32,80,73,84,67,72,32,32}; return L[lc]; } // "MASK PITCH  "
     }
     if (c == 14) return 58;
     if (c == 15) return 32;
@@ -355,12 +377,24 @@ int menu_char_at(int row, int col) {
         const int V[9] = {70,85,76,76,32,87,73,78,32}; return V[vc];                               // "FULL WIN "
     }
     if (item == 4) {
-        if (pc.mask_layout == 0u) { const int V[9] = {83,79,78,89,32,83,70,80,32}; return V[vc]; } // "SONY SFP "
-        if (pc.mask_layout == 1u) { const int V[9] = {87,69,71,65,32,48,46,55,53}; return V[vc]; } // "WEGA 0.75"
-        if (pc.mask_layout == 2u) { const int V[9] = {66,86,77,45,68,50,52,32,32}; return V[vc]; } // "BVM-D24  "
-        if (pc.mask_layout == 5u) { const int V[9] = {66,86,77,45,68,51,50,32,32}; return V[vc]; } // "BVM-D32  "
-        if (pc.mask_layout == 3u) { const int V[9] = {83,76,79,84,32,77,65,83,75}; return V[vc]; } // "SLOT MASK"
+        if (MASK_LAYOUT == 0u) { const int V[9] = {83,79,78,89,32,83,70,80,32}; return V[vc]; } // "SONY SFP "
+        if (MASK_LAYOUT == 1u) { const int V[9] = {87,69,71,65,32,48,46,55,53}; return V[vc]; } // "WEGA 0.75"
+        if (MASK_LAYOUT == 2u) { const int V[9] = {66,86,77,45,68,50,52,32,32}; return V[vc]; } // "BVM-D24  "
+        if (MASK_LAYOUT == 5u) { const int V[9] = {66,86,77,45,68,51,50,32,32}; return V[vc]; } // "BVM-D32  "
+        if (MASK_LAYOUT == 3u) { const int V[9] = {83,76,79,84,32,77,65,83,75}; return V[vc]; } // "SLOT MASK"
         const int V[9] = {68,79,84,32,84,82,73,79,32}; return V[vc];                               // "DOT TRIO "
+    }
+    if (item == 12) {
+        // "100% 5PX ": the pitch against the tube's own, and the triad's width where it is whole pixels.
+        uint pct = uint(mask_pitch_scale() * 100.0 + 0.5);
+        if (vc == 0) return pct >= 100u ? 48 + int(pct / 100u) : 32;
+        if (vc == 1) return 48 + int((pct / 10u) % 10u);
+        if (vc == 2) return 48 + int(pct % 10u);
+        if (vc == 3) return 37;
+        int px = int(g_triad_px + 0.5), p = vc - 5, dl = px >= 10 ? 2 : 1;
+        if (vc == 4 || px <= 0) return 32;
+        if (p < dl) return 48 + (dl == 2 && p == 0 ? px / 10 : px % 10);
+        return p == dl ? 80 : p == dl + 1 ? 88 : 32;
     }
     if (item == 5) return format_float_char(pc.vm_strength, vc);
     if (item == 6) return format_float_char(pc.horiz_smear, vc);
@@ -515,6 +549,7 @@ void evaluate_sony_wega_osd(vec2 uv, inout vec3 out_rgb) {
         vec2 m_min = vec2(0.035, 0.065);
         int   items  = menu_items();
         float m_rows = float(items + 2);
+        g_triad_px = mask_locked_px(tube_size_px().x / (mask_raster_mm() / max(mask_pitch_mm(), 0.09)), 1.0);
         vec2 m_max = vec2(0.515, 0.065 + m_rows * 0.0509167);
         if (uv.x >= m_min.x && uv.x < m_max.x && uv.y >= m_min.y && uv.y < m_max.y) {
             vec2 rel = (uv - m_min) / (m_max - m_min);
@@ -547,8 +582,9 @@ void evaluate_sony_wega_osd(vec2 uv, inout vec3 out_rgb) {
                 } else {
                     out_rgb = vec3(0.18, 0.96, 0.28);
                 }
-                if ((row == 10 && pc.output_mode < 0.5) || (row == 11 && ((pc.osd_mode >> 6) & 1u) == 0u) ||
-                    (row == 12 && items == 12 && ((pc.osd_mode >> 27) & 1u) != 0u)) out_rgb *= 0.65;
+                int it = (row >= 1 && row <= items) ? menu_item(row - 1) : -1;
+                if ((it == 9 && pc.output_mode < 0.5) || (it == 10 && ((pc.osd_mode >> 6) & 1u) == 0u) ||
+                    (it == 11 && ((pc.osd_mode >> 27) & 1u) != 0u)) out_rgb *= 0.65;
             } else if (hit == 1) {
                 out_rgb = vec3(0.0);
             }
@@ -645,7 +681,7 @@ vec2 spot_gap_ratio(uint mask) {
 }
 
 vec3 spot_sigma_mm(vec3 L, float pitch_mm, float waist) {
-    vec2  r   = spot_gap_ratio(pc.mask_layout);
+    vec2  r   = spot_gap_ratio(MASK_LAYOUT);
     vec3  b   = pow(clamp(L, vec3(0.0), vec3(1.5)), vec3(0.70));
     vec3  cap = pitch_mm * (r.x + (r.y - r.x) * min(b, vec3(1.0)));
     return min((vec3(0.28) + 0.30 * b) * waist, cap) * pc.beam_sigma_scale;
@@ -704,12 +740,18 @@ vec3 stripe_cover(vec3 dx, vec3 half_w, float aa) {
     return clamp((min(dx + aa, half_w) - max(dx - aa, -half_w)) / (2.0 * aa), vec3(0.0), vec3(1.0));
 }
 
-// Slot mask: each stripe is cut into slots two triad pitches apart with rounded ends, SLOT_GAP of
-// black between them, a triad's slots half a pitch up from its neighbours'.
+// Slot mask: each stripe is cut into slots with rounded ends, two rows from one to the next, a row
+// SLOT_ROW of a triad pitch (0.75 mm down against 0.88 mm across), SLOT_GAP of a row black between
+// them, a triad's slots a row up from its neighbours'. slot_area: a slot's area in triads by rows.
+const float SLOT_ROW = 0.4261364;
 const float SLOT_GAP = 0.24;
 float slot_area(float width) {
-    return width * (2.0 - SLOT_GAP - width) + 0.7853982 * width * width;
+    return width * (2.0 - SLOT_GAP - width / SLOT_ROW) + 0.7853982 * width * width / SLOT_ROW;
 }
+// The bridge between slots as the eye sees it at a distance, and the share of a slot period it takes:
+// 0.2538, or what the screen's pixels take of it where the rows are whole pixels (set with the rows).
+float slot_bridge(float v) { float t = (v - 0.5) / 0.14; t *= t; return exp(-t * t); }
+float g_slot_bridge = 0.2538;
 
 // Aperture mask as a factor on the beam's light; stripes widen with the beam level. locked: the
 // mask is drawn in whole pixels (see the caller).
@@ -719,7 +761,7 @@ vec3 mask_factor(vec3 level, float effective_zoom, float d_triad, float triad_co
     // d_triad: triads per output pixel.
     float macro_blend = macro_of(effective_zoom);
 
-    if (pc.mask_layout <= 2u || pc.mask_layout == 5u) {
+    if (MASK_LAYOUT <= 2u || MASK_LAYOUT == 5u) {
         // Horizontal Lumina Expansion: strongly excited phosphor stripes expand their effective
         // crystal duty cycle across the black carbon guard band (from 0.24 at dark up to 0.38 at peak)!
         vec3 duty = clamp(vec3(0.24) + 0.14 * pow(clamp(level, vec3(0.0), vec3(1.4)), vec3(0.75)), vec3(0.23), vec3(0.39));
@@ -762,7 +804,7 @@ vec3 mask_factor(vec3 level, float effective_zoom, float d_triad, float triad_co
 
         // At 1x scale, blend between gentle eye-integrated triad contrast and full macro stripes based on pixel density
         float grille_strength_1x = pc.mask_strength > 0.0 ? pc.mask_strength
-                                 : ((pc.mask_layout == 1u) ? 0.38 : ((pc.mask_layout == 2u || pc.mask_layout == 5u) ? 0.18 : 0.28));
+                                 : ((MASK_LAYOUT == 1u) ? 0.38 : ((MASK_LAYOUT == 2u || MASK_LAYOUT == 5u) ? 0.18 : 0.28));
         float blend_to_full = mix(grille_strength_1x, 1.0, macro_blend);
         // Where the pixels are too coarse for the upper harmonics the series would dip below zero
         // between the stripes. Clipped there it averaged above 1, by a different amount for each
@@ -781,32 +823,32 @@ vec3 mask_factor(vec3 level, float effective_zoom, float d_triad, float triad_co
         float aa    = max(0.5 * d_triad, 1e-4);
         vec3  lit   = stripe_cover(stripe_offset(tphase), vec3(0.5 * STRIPE_W), aa) / STRIPE_W;
         return mix(eye, mix(vec3(1.0), lit, smoothstep(0.90, 0.20, d_triad)), macro_blend);
-    } else if (pc.mask_layout == 3u) {
+    } else if (MASK_LAYOUT == 3u) {
         vec3 phases1 = 6.28318530 * (triad_phase - vec3(0.1666667, 0.5000000, 0.8333333));
         float p_arg1 = 3.14159265 * min(d_triad, 1.0);
         float px_sinc1 = (sin(p_arg1) / max(p_arg1, 1e-4)) * smoothstep(0.90, 0.20, d_triad);
 
         float col_parity = mod(triad_idx, 2.0);
         float slot_v = fract(scan_y_for_mask * 0.5 + col_parity * 0.5);
-        float bridge = 1.0 - (0.32 + 0.38 * macro_blend) * exp(-pow((slot_v - 0.5) / 0.14, 4.0));
+        float bridge = 1.0 - (0.32 + 0.38 * macro_blend) * slot_bridge(slot_v);
 
-        // The bridge takes 0.2538 of its depth off the average; the pattern is scaled back to 1.
+        // The bridge takes g_slot_bridge of its depth off the average; the pattern is scaled back to 1.
         vec3 slot_rgb = vec3(1.0) + (0.34 + 0.62 * macro_blend) * px_sinc1 * cos(phases1);
-        slot_rgb = max(vec3(0.09), slot_rgb) * bridge / (1.0 - 0.2538 * (0.32 + 0.38 * macro_blend));
+        slot_rgb = max(vec3(0.09), slot_rgb) * bridge / (1.0 - g_slot_bridge * (0.32 + 0.38 * macro_blend));
         vec3 eye = mix(slot_rgb, vec3(1.0), clamp(level * 0.38, 0.0, 0.55));
         if (locked || macro_blend <= 0.0) return eye;
 
         // A pixel takes what it covers of each slot: across, the slot's width at that height; down,
-        // two heights within the pixel (aa: half a pixel in triads, which are the rows here).
+        // two heights within the pixel (aa: half a pixel in triads; a row is SLOT_ROW of one).
         float hw    = 0.5 * STRIPE_W;
         float aa    = max(0.5 * d_triad, 1e-4);
         vec3  dx    = stripe_offset(vec3(triad_coord));
         vec3  up    = mod(floor(vec3(triad_coord) - vec3(0.1666667, 0.5000000, 0.8333333) + 0.5), 2.0) * 0.5;
         vec3  lit   = vec3(0.0);
         for (int k = 0; k < 2; k++) {
-            float y     = scan_y_for_mask + (k == 0 ? -0.5773503 : 0.5773503) * aa;
+            float y     = scan_y_for_mask + (k == 0 ? -0.5773503 : 0.5773503) * aa / SLOT_ROW;
             vec3  along = 1.0 - 2.0 * abs(fract(vec3(y * 0.5) + up) - 0.5);
-            vec3  past  = max(along - (1.0 - 0.5 * SLOT_GAP - hw), vec3(0.0));
+            vec3  past  = max(along - (1.0 - 0.5 * SLOT_GAP) + hw / SLOT_ROW, vec3(0.0)) * SLOT_ROW;
             lit += stripe_cover(dx, sqrt(max(vec3(hw * hw) - past * past, vec3(0.0))), aa);
         }
         lit /= slot_area(STRIPE_W);
@@ -826,12 +868,12 @@ vec3 mask_factor(vec3 level, float effective_zoom, float d_triad, float triad_co
             lit *= DOT_RADIUS * DOT_RADIUS / (DOT_RADIUS * DOT_RADIUS + 0.2 * aa * aa);
             return mix(vec3(1.0), lit / DOT_FILL, smoothstep(0.90, 0.20, d_triad) * mix(0.35, 1.0, macro_blend));
         }
-        // In whole pixels a dot is under two pixels: the lattice's first harmonics, which average to
-        // 1 for each colour over a triad and a pair of rows of whole pixels (no tint, no dimming).
+        // In whole pixels the dots are too fine to draw: each row carries the lattice's first harmonic
+        // across it, which averages to 1 for each colour over a triad at every height, so there is no
+        // tint or dimming and the rows cannot beat with the scan lines.
         vec3  px = 6.28318530 * (vec3(triad_coord + row_stagger) - vec3(0.1666667, 0.5000000, 0.8333333));
-        float py = 3.14159265 * fy;
-        float locked_vis = smoothstep(0.90, 0.20, d_triad) * 0.35;
-        return vec3(1.0) + locked_vis * (2.0 * cos(px) * cos(py) + vec3(cos(2.0 * py))) / 3.0;
+        float locked_vis = smoothstep(0.90, 0.20, d_triad) * 0.2333333;
+        return vec3(1.0) + locked_vis * cos(px) * cos(3.14159265 * fy);
     }
 }
 
@@ -840,7 +882,7 @@ vec3 mask_factor(vec3 level, float effective_zoom, float d_triad, float triad_co
 // stripes), so the flicker limit set from it is the same across a triad.
 float mask_peak(float effective_zoom, float d_triad, bool locked) {
     float macro_blend = macro_of(effective_zoom);
-    if (pc.mask_layout <= 2u || pc.mask_layout == 5u) {
+    if (MASK_LAYOUT <= 2u || MASK_LAYOUT == 5u) {
         float px1, px2, px3;
         if (pc.subpixel_layout > 0.5) {
             float w = 3.14159265 * d_triad / 3.0;
@@ -858,21 +900,21 @@ float mask_peak(float effective_zoom, float d_triad, bool locked) {
                              + abs(sin(6.28318530 * duty) / (6.28318530 * duty)) * 0.6366 * abs(px2)
                              + abs(sin(9.42477796 * duty) / (9.42477796 * duty)) * 0.3001 * abs(px3));
         float strength = pc.mask_strength > 0.0 ? pc.mask_strength
-                       : ((pc.mask_layout == 1u) ? 0.38 : ((pc.mask_layout == 2u || pc.mask_layout == 5u) ? 0.18 : 0.28));
+                       : ((MASK_LAYOUT == 1u) ? 0.38 : ((MASK_LAYOUT == 2u || MASK_LAYOUT == 5u) ? 0.18 : 0.28));
         float blend = mix(strength, 1.0, macro_blend);
         float eye = mix(1.0, g, blend) + 0.1 * blend;
         if (locked || macro_blend <= 0.0) return eye;
         return mix(eye, mix(1.0, 1.0 / STRIPE_W, smoothstep(0.90, 0.20, d_triad)), macro_blend);
     }
-    if (pc.mask_layout == 3u) {
+    if (MASK_LAYOUT == 3u) {
         float a1 = 3.14159265 * min(d_triad, 1.0);
         float px1 = (sin(a1) / max(a1, 1e-4)) * smoothstep(0.90, 0.20, d_triad);
-        float eye = (1.0 + (0.34 + 0.62 * macro_blend) * abs(px1)) / (1.0 - 0.2538 * (0.32 + 0.38 * macro_blend));
+        float eye = (1.0 + (0.34 + 0.62 * macro_blend) * abs(px1)) / (1.0 - g_slot_bridge * (0.32 + 0.38 * macro_blend));
         if (locked || macro_blend <= 0.0) return eye;
         return mix(eye, mix(1.0, 2.0 / slot_area(STRIPE_W), smoothstep(0.90, 0.20, d_triad)), macro_blend);
     }
     if (!locked) return mix(1.0, 1.0 / DOT_FILL, smoothstep(0.90, 0.20, d_triad) * mix(0.35, 1.0, macro_blend));
-    return 1.0 + smoothstep(0.90, 0.20, d_triad) * 0.35;
+    return 1.0 + smoothstep(0.90, 0.20, d_triad) * 0.2333333;
 }
 #endif
 
@@ -924,6 +966,32 @@ vec2 tube_size_px() {
     float t = tube_aspect();
     return t < win_aspect ? vec2(float(pc.output_size.y) * t, float(pc.output_size.y))
                           : vec2(float(pc.output_size.x), float(pc.output_size.x) / t);
+}
+
+// The layout's pitch on the glass: its own monitor's mean pitch as a part of that monitor's picture, so
+// this picture carries as many triads as the real one.
+//   WEGA 0.75: 0.72 mm here, as Sony's Hi-Scan grille (about 853 stripes across a 16:9 picture).
+//   BVM-D24E1WU: 0.25-0.28 mm on a 482.1 mm wide picture. BVM-D32E1WU: 0.32-0.36 mm on 655.2 mm.
+//   Slot mask: a 27-inch television tube, 0.80-0.96 mm on a picture 411.5 mm high.
+//   Dot trio: a 15-inch 0.28 mm monitor, picture 210.3 mm high; a triad along a row is 1.732 dot pitches.
+float mask_pitch_mm() {
+    float p = pc.sfp_pitch_mm;
+    if (MASK_LAYOUT == 1u) p = max(pc.sfp_pitch_mm, 0.72);
+    else if (MASK_LAYOUT == 2u || MASK_LAYOUT == 5u) p = TUBE_H_MM * (16.0 / 9.0) * (MASK_LAYOUT == 2u ? 0.2595 / 482.1 : 0.3322 / 655.2);
+    else if (MASK_LAYOUT == 3u) p = TUBE_H_MM * 0.88 / 411.5;
+    else if (MASK_LAYOUT == 4u) p = TUBE_H_MM * 0.28 * 1.7320508 / 210.3;
+    return max(p, 0.18) * mask_pitch_scale();
+}
+float mask_raster_mm() {
+    uint am = pc.aspect_mode & 255u;
+    return TUBE_H_MM * (am == 1u ? 16.0 / 9.0 : am >= 3u ? tube_aspect() : 4.0 / 3.0);
+}
+// The whole number of screen pixels a triad is drawn at, or 0 where the true pitch is drawn (magnified,
+// or eight pixels and more; sixteen for the dot trio, whose dots alias against the pixels until then).
+// Three is the least that still shows the stripes; under 2.25 it gets two.
+float mask_locked_px(float px_triad, float zoom) {
+    if (zoom > 1.0 || px_triad >= (MASK_LAYOUT == 4u ? 16.0 : 8.0)) return 0.0;
+    return px_triad >= 2.25 ? max(3.0, round(px_triad)) : 2.0;
 }
 
 #ifndef KD30_WEB
@@ -1035,24 +1103,9 @@ vec3 evaluate_crt_raster_at(vec2 uv_in, float effective_zoom, bool use_table, ou
         return vec3(0.0);
     }
 
-    float eff_pitch_mm = pc.sfp_pitch_mm;
-    float bvm_waist_scale = 1.0;
-    bool  has_damper_wires = true;
-
-    if (pc.mask_layout == 1u) {
-        eff_pitch_mm = max(pc.sfp_pitch_mm, 0.72); // Consumer WEGA (~1.5 triads per Genesis pixel)
-    } else if (pc.mask_layout == 2u || pc.mask_layout == 5u) {
-        // BVM-D24E1WU: 0.25-0.28 mm on a 482.1 mm wide picture; BVM-D32E1WU: 0.32-0.36 mm on 655.2 mm.
-        // Drawn on this raster as the same number of stripes across the picture (mean pitch).
-        eff_pitch_mm = TUBE_H_MM * (16.0 / 9.0) * (pc.mask_layout == 2u ? 0.2595 / 482.1 : 0.3322 / 655.2);
-        bvm_waist_scale = 0.82;
-    } else if (pc.mask_layout == 3u) {
-        eff_pitch_mm = 0.62;                       // Staggered Slot Mask
-        has_damper_wires = false;
-    } else if (pc.mask_layout == 4u) {
-        eff_pitch_mm = 0.56;                       // Staggered Dot-Trio Shadow Mask
-        has_damper_wires = false;
-    }
+    float eff_pitch_mm = mask_pitch_mm();
+    float bvm_waist_scale = (MASK_LAYOUT == 2u || MASK_LAYOUT == 5u) ? 0.82 : 1.0;
+    bool  has_damper_wires = MASK_LAYOUT != 3u && MASK_LAYOUT != 4u;
 
     // The mask is fixed to the glass, so its coordinates come from the screen position (uv_in), not the
     // breathing raster. A triad only a few screen pixels wide is drawn a whole number of pixels wide
@@ -1060,14 +1113,15 @@ vec3 evaluate_crt_raster_at(vec2 uv_in, float effective_zoom, bool use_table, ou
     // against the pixel grid (moiré). Three pixels is the least that still shows the stripes; a triad
     // under 2.25 pixels gets two. The magnifier shows the true, graded pitch.
     uint  am           = pc.aspect_mode & 255u;
-    float raster_w_mm  = TUBE_H_MM * (am == 1u ? 16.0 / 9.0 : am >= 3u ? tube_aspect() : 4.0 / 3.0);
+    float raster_w_mm  = mask_raster_mm();
     vec2  tube_px      = tube_size_px() * max(effective_zoom, 1.0);
-    float phys_triads  = raster_w_mm / max(eff_pitch_mm, 0.18);
+    float phys_triads  = raster_w_mm / max(eff_pitch_mm, 0.09);
     float px_triad     = tube_px.x / phys_triads;
-    bool  px_locked    = effective_zoom <= 1.0 && px_triad < 8.0;
-    float total_triads = px_locked ? tube_px.x / (px_triad >= 2.25 ? max(3.0, round(px_triad)) : 2.0) : phys_triads;
+    float lock_px      = mask_locked_px(px_triad, effective_zoom);
+    bool  px_locked    = lock_px > 0.0;
+    float total_triads = px_locked ? tube_px.x / lock_px : phys_triads;
     float u_sym = uv_in.x * 2.0 - 1.0;
-    float alpha_edge = (pc.mask_layout == 2u || pc.mask_layout == 5u) ? 0.11 : 0.065;
+    float alpha_edge = (MASK_LAYOUT == 2u || MASK_LAYOUT == 5u) ? 0.11 : 0.065;
     float x_grille = px_locked ? uv_in.x : 0.5 + 0.5 * (u_sym - (alpha_edge / 3.0) * u_sym * u_sym * u_sym) / (1.0 - alpha_edge / 3.0);
     float inst_freq_scale = px_locked ? 1.0 : (1.0 - alpha_edge * u_sym * u_sym) / (1.0 - alpha_edge / 3.0);
     float d_triad      = total_triads * inst_freq_scale / tube_px.x;
@@ -1077,11 +1131,18 @@ vec3 evaluate_crt_raster_at(vec2 uv_in, float effective_zoom, bool use_table, ou
 
     // Mask rows (slot and dot masks), whole pixels tall on the same terms. The dot mask's rows are
     // 0.866 of a dot spacing (a third of the triad) apart; drawn in whole pixels, 0.866 of a triad.
-    bool  dot_mask = pc.mask_layout == 4u;
-    float row_unit = eff_pitch_mm * (dot_mask ? (px_locked ? 0.8660254 : 0.2886751) : 1.0);
+    bool  dot_mask = MASK_LAYOUT == 4u;
+    float row_unit = eff_pitch_mm * (dot_mask ? (px_locked ? 0.8660254 : 0.2886751) : MASK_LAYOUT == 3u ? SLOT_ROW : 1.0);
     float row_px   = tube_px.y * row_unit / TUBE_H_MM;
     float rows     = px_locked ? tube_px.y / max(2.0, round(row_px)) : TUBE_H_MM / row_unit;
     float scan_y_for_mask = uv_in.y * rows * (dot_mask ? 0.8660254 : 1.0);
+    if (px_locked && MASK_LAYOUT == 3u) {
+        // The pixels of one slot period that fall on the bridge (within 0.3 of a period of its middle).
+        float n2 = 2.0 * max(2.0, round(row_px)), ph = fract(scan_y_for_mask * 0.5 * n2), sum = 0.0;
+        float n = ceil(0.2 * n2 - ph);
+        for (int k = 0; k < 24 && n < 0.8 * n2 - ph; k++, n += 1.0) sum += slot_bridge((n + ph) / n2);
+        g_slot_bridge = sum / n2;
+    }
 
     // The beam is sampled at the nearest red (1/6), green (3/6) and blue (5/6) stripes, carried from the
     // glass to the raster, so a stripe or dot is lit evenly across. Dot rows sit half a triad along
