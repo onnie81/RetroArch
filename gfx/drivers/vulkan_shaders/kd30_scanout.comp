@@ -56,7 +56,7 @@ layout(push_constant) uniform ScanoutPush {
     uint  signal_standard;  // 0 = NTSC (SMPTE-C / Sony 9300K Red-Push, 59.94Hz), 1 = PAL (EBU P22, 50Hz)
     uint  input_mode;       // 0 = VIDEO 1 Composite (CVBS), 1 = VIDEO 2 S-Video (Y/C), 2 = VIDEO 4 Component/RGB
     uint  osd_mode;         // bits 25-27: the web player's STREAM row; bits 0-1: 0 = Off, 1 = Top-Right Input Banner Only, 2 = Full Interactive WEGA OSD Menu; 4-5 persistence (P22, MEDIUM, LONG, ADAPTIVE), 6 beam on; disc row: 8-15 disc, 16-23 discs, 24 tray open
-    uint  osd_selected_row; // 0..10, or 0..11 with the STREAM row
+    uint  osd_selected_row; // the row in bits 0-7; the web player's VOLUME in bits 8-15 (percent), bit 16 when muted
     uint  perf_overlay_on;  // 1 = Show compact bottom-right performance telemetry HUD (F key)
     uint  mask_layout;      // 0 = Sony SFP (0.45mm), 1 = Consumer WEGA (0.75mm), 2 = BVM-D24E1WU, 3 = Slot Mask, 4 = Dot-Trio Shadow Mask, 5 = BVM-D32E1WU, 6 = GDM-FW900
     uint  aspect_mode;      // bits 0-7: 0 = 4:3 CRT Pillarbox (3:4 in TATE), 1 = 16:9 Wide Tube, 2 = Full Window Stretch, 3 = core's aspect (bits 8-31, x4096), 4 = square pixels
@@ -300,14 +300,16 @@ int banner_char_at(int row, int col) {
     return 32;
 }
 
-// The web player adds a STREAM row (osd_mode bits 25-26: 1 lossless, 2 H.264; bit 27 when it is fixed)
-// and a MASK PITCH row under MASK LAYOUT (bit 28).
+// The web player adds a STREAM row (osd_mode bits 25-26: 1 lossless, 2 H.264; bit 27 when it is fixed),
+// a MASK PITCH row under MASK LAYOUT (bit 28) and a VOLUME row at the end (bit 29).
 bool menu_pitch_row() { return ((pc.osd_mode >> 28) & 1u) != 0u; }
+bool menu_volume_row() { return ((pc.osd_mode >> 29) & 1u) != 0u; }
 int menu_items() {
-    return 11 + (((pc.osd_mode >> 25) & 3u) != 0u ? 1 : 0) + (menu_pitch_row() ? 1 : 0);
+    return 11 + (((pc.osd_mode >> 25) & 3u) != 0u ? 1 : 0) + (menu_pitch_row() ? 1 : 0) + (menu_volume_row() ? 1 : 0);
 }
-// The item on a row: MASK PITCH is item 12 and takes the sixth row.
+// The item on a row: MASK PITCH is item 12 and takes the sixth row; VOLUME is item 13 and takes the last.
 int menu_item(int vis) {
+    if (menu_volume_row() && vis == menu_items() - 1) return 13;
     if (!menu_pitch_row() || vis < 5) return vis;
     return vis == 5 ? 12 : vis - 1;
 }
@@ -330,7 +332,7 @@ int menu_char_at(int row, int col) {
     if (vis < 0 || vis >= menu_items()) return 32;
     int item = menu_item(vis);
 
-    if (c == 0) return (uint(vis) == pc.osd_selected_row) ? 62 : 32;
+    if (c == 0) return (uint(vis) == (pc.osd_selected_row & 255u)) ? 62 : 32;
     if (c == 1) return 32;
 
     if (c >= 2 && c <= 13) {
@@ -348,6 +350,7 @@ int menu_char_at(int row, int col) {
         if (item == 10) { const int L[12] = {80,69,82,83,73,83,84,69,78,67,69,32}; return L[lc]; } // "PERSISTENCE "
         if (item == 11) { const int L[12] = {83,84,82,69,65,77,32,32,32,32,32,32}; return L[lc]; } // "STREAM      "
         if (item == 12) { const int L[12] = {77,65,83,75,32,80,73,84,67,72,32,32}; return L[lc]; } // "MASK PITCH  "
+        if (item == 13) { const int L[12] = {86,79,76,85,77,69,32,32,32,32,32,32}; return L[lc]; } // "VOLUME      "
     }
     if (c == 14) return 58;
     if (c == 15) return 32;
@@ -384,6 +387,14 @@ int menu_char_at(int row, int col) {
         if (MASK_LAYOUT == 6u) { const int V[9] = {71,68,77,45,70,87,57,48,48}; return V[vc]; } // "GDM-FW900"
         if (MASK_LAYOUT == 3u) { const int V[9] = {83,76,79,84,32,77,65,83,75}; return V[vc]; } // "SLOT MASK"
         const int V[9] = {68,79,84,32,84,82,73,79,32}; return V[vc];                               // "DOT TRIO "
+    }
+    if (item == 13) {
+        if (((pc.osd_selected_row >> 16) & 1u) != 0u) { const int V[9] = {77,85,84,69,32,32,32,32,32}; return V[vc]; } // "MUTE"
+        uint pct = (pc.osd_selected_row >> 8) & 255u;
+        if (vc == 0) return pct >= 100u ? 48 + int(pct / 100u) : 32;
+        if (vc == 1) return pct >= 10u ? 48 + int((pct / 10u) % 10u) : 32;
+        if (vc == 2) return 48 + int(pct % 10u);
+        return vc == 3 ? 37 : 32;
     }
     if (item == 12) {
         // "100% 5PX ": the pitch against the tube's own, and the triad's width where it is whole pixels.
@@ -567,7 +578,7 @@ void evaluate_sony_wega_osd(vec2 uv, inout vec3 out_rgb) {
                 return;
             }
 
-            bool is_selected_row = (row >= 1 && row <= items && uint(row - 1) == pc.osd_selected_row);
+            bool is_selected_row = (row >= 1 && row <= items && uint(row - 1) == (pc.osd_selected_row & 255u));
             vec3 panel_bg = is_selected_row ? vec3(0.05, 0.16, 0.22) : vec3(0.02, 0.04, 0.07);
             out_rgb = mix(out_rgb, panel_bg, 0.93);
 
