@@ -59,7 +59,7 @@ layout(push_constant) uniform ScanoutPush {
     uint  osd_selected_row; // the row in bits 0-7; the web player's VOLUME in bits 8-15 (percent), bit 16 when muted
     uint  perf_overlay_on;  // 1 = Show compact bottom-right performance telemetry HUD (F key)
     uint  mask_layout;      // 0 = Sony SFP (0.45mm), 1 = Consumer WEGA (0.75mm), 2 = BVM-D24E1WU, 3 = Slot Mask, 4 = Dot-Trio Shadow Mask, 5 = BVM-D32E1WU, 6 = GDM-FW900
-    uint  aspect_mode;      // bits 0-7: 0 = 4:3 CRT Pillarbox (3:4 in TATE), 1 = 16:9 Wide Tube, 2 = Full Window Stretch, 3 = core's aspect (bits 8-31, x4096), 4 = square pixels
+    uint  aspect_mode;      // bits 0-7: 0 = 4:3 CRT Pillarbox (3:4 in TATE), 1 = 16:9 Wide Tube, 2 = Full Window Stretch, 3 = core's aspect (bits 8-31, x4096; in the other modes bit 8 = woven landscape fields), 4 = square pixels
     float sfp_pitch_mm;     // Aperture grille pitch control (0.45 default)
     float hv_breathing;     // 0.005 DA-4 HV regulation sag
     float damper_str;       // 0.14 dual tungsten damper wires
@@ -608,11 +608,13 @@ void evaluate_sony_wega_osd(vec2 uv, inout vec3 out_rgb) {
 // picture), the aspect the core reports, square pixels, or the whole window.
 float tube_aspect() {
     uint m = pc.aspect_mode & 255u;
-    bool is_tate = pc.raw_size.y > pc.raw_size.x;
+    // Bit 8: the tall frame is two woven fields of a landscape picture (320x448i), not an upright one.
+    bool woven = m != 3u && (pc.aspect_mode & 256u) != 0u;
+    bool is_tate = pc.raw_size.y > pc.raw_size.x && !woven;
     if (m == 0u) return is_tate ? 3.0 / 4.0 : 4.0 / 3.0;
     if (m == 1u) return is_tate ? 9.0 / 16.0 : 16.0 / 9.0;
     if (m == 3u) return clamp(float(pc.aspect_mode >> 8) / 4096.0, 0.25, 4.0);
-    if (m == 4u) return clamp(float(pc.raw_size.x) / float(max(pc.raw_size.y, 1u)), 0.25, 4.0);
+    if (m == 4u) return clamp(float(pc.raw_size.x) / float(max(woven ? pc.raw_size.y / 2u : pc.raw_size.y, 1u)), 0.25, 4.0);
     return float(pc.output_size.x) / float(max(pc.output_size.y, 1u));
 }
 
